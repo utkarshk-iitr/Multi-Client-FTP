@@ -1,4 +1,8 @@
 #include <iostream>
+#include <pwd.h>
+#include <grp.h>
+#include <ctime>
+#include <sstream>
 #include <fstream>
 #include <cstdlib>
 #include <cstring>
@@ -7,58 +11,75 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <dirent.h>
+#include <vector>
 #include <sys/stat.h>
 
-#define PORT 8080
 #define MAX_CLIENTS 8
 #define BUFFER_SIZE 4096
+#define RESET   "\033[0m"
+#define RED     "\033[31m"      // Red text
+#define GREEN   "\033[32m"      // Green text
+#define YELLOW  "\033[33m"      // Yellow text
+#define BLUE    "\033[34m"      // Blue text
+#define MAGENTA "\033[35m"      // Magenta text
+#define CYAN    "\033[36m"      // Cyan text
+#define BOLD    "\033[1m"       // Bold text
 
 using namespace std;
-
 pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 void *handle_client(void *client_socket);
 
-int main()
+int main(int argc, char *argv[])
 {
+    if (argc != 2) {
+        cerr << "Usage: " << argv[0] << " <port>\n";
+        return EXIT_FAILURE;
+    }
+
+    int port = atoi(argv[1]);
+    if (port <= 0 || port > 65535) {
+        cerr << "Invalid port number: " << argv[1] << "\n";
+        return EXIT_FAILURE;
+    }
+
     int server_fd, client_socket;
     struct sockaddr_in server_addr, client_addr;
     socklen_t addr_len = sizeof(client_addr);
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1)
-    {
+    if (server_fd == -1) {
         perror("Socket creation failed");
         exit(EXIT_FAILURE);
     }
 
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
+    server_addr.sin_port = htons(port);
 
-    if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
-    {
+    int opt = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+        perror("Cant reuse");
+        exit(EXIT_FAILURE);
+    }
+
+    if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("Bind failed");
         exit(EXIT_FAILURE);
     }
 
-    if (listen(server_fd, MAX_CLIENTS) < 0)
-    {
+    if (listen(server_fd, MAX_CLIENTS) < 0) {
         perror("Listen failed");
         exit(EXIT_FAILURE);
     }
 
-    cout << "FTP Server started on port " << PORT << "...\n";
+    cout << "FTP Server started on port " << port << "...\n";
 
-    while (true)
-    {
+    while (true) {
         client_socket = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
-        if (client_socket < 0)
-        {
+        if (client_socket < 0) {
             perror("Client accept failed");
             continue;
         }
-
         pthread_t thread_id;
         pthread_create(&thread_id, NULL, handle_client, (void *)&client_socket);
         pthread_detach(thread_id);
@@ -67,6 +88,7 @@ int main()
     close(server_fd);
     return 0;
 }
+
 
 void *handle_client(void *client_socket)
 {
@@ -88,25 +110,135 @@ void *handle_client(void *client_socket)
         string command(buffer);
         command = command.substr(0, command.find("\n")); // Remove newline
 
-        if (command == "ls")
+        if (command == "pwd")
         {
-            DIR *dir;
-            struct dirent *entry;
-            string response = "";
-            if ((dir = opendir(client_directory.c_str())) != NULL)
+            // send the client's current working directory
+            send(sock, client_directory.c_str(), client_directory.size(), 0);
+        }
+        
+        else if (command.substr(0, 2) == "ls")
+        {
+            // 1) parse options
+            bool show_all   = false;
+            bool long_fmt   = false;
+            vector<string> tokens;
+            
+
+            istringstream iss(command);
+            string t;
+            while (iss >> t) tokens.push_back(t);
+            
+            int f=0;
+            for (size_t i = 1; i < tokens.size(); ++i)
             {
-                while ((entry = readdir(dir)) != NULL)
+                // cout<<"tokens[i]="<<tokens[i]<<endl;
+                string opt = tokens[i];
+                if (opt == "-a")          
                 {
-                    response += string(entry->d_name) + "\n";
+                    show_all = true;
+                    // cout<<"here"<<endl;
                 }
-                closedir(dir);
+                else if (opt == "-l")     
+                {
+                    long_fmt = true;
+                    // cout<<"here2"<<endl;
+                }
+                else if (opt == "-al" || opt == "-la")   
+                { 
+                    show_all = long_fmt = true; 
+                    // cout<<"here3"<<endl;
+                }
+                else
+                {
+                    // Invalid option
+                    // cout<<"here4"<<endl;
+                    const char *err = "Invalid option\n";
+                    send(sock, err, strlen(err), 0);
+                    f=-1;
+                    break;
+                }
+            }
+            
+            if(f==-1)
+            {
+                continue;
+            }
+            // 2) open directory
+            DIR *dir = opendir(client_directory.c_str());
+            if (!dir)
+            {
+                const char *err = "Error opening directory\n";
+                send(sock, err, strlen(err), 0);
             }
             else
             {
-                response = "Error opening directory\n";
+                struct dirent *entry;
+                string response;
+                while ((entry = readdir(dir)) != nullptr)
+                {
+                    const char *name = entry->d_name;
+                    // skip hidden unless -a
+                    if (!show_all && name[0] == '.') 
+                        continue;
+        
+                    if (!long_fmt)
+                    {
+                        response += name;
+                        response += '\n';
+                    }
+                    else
+                    {
+                        // build full path and stat it
+                        string full = client_directory + "/" + name;
+                        struct stat st;
+                        if (stat(full.c_str(), &st) != 0) 
+                            continue;  // skip if stat fails
+        
+                        // permissions
+                        char perms[11] = {'-','r','w','x','r','w','x','r','w','x','\0'};
+                        perms[0] = S_ISDIR(st.st_mode) ? 'd' : '-';
+                        perms[1] = (st.st_mode & S_IRUSR) ? 'r' : '-';
+                        perms[2] = (st.st_mode & S_IWUSR) ? 'w' : '-';
+                        perms[3] = (st.st_mode & S_IXUSR) ? 'x' : '-';
+                        perms[4] = (st.st_mode & S_IRGRP) ? 'r' : '-';
+                        perms[5] = (st.st_mode & S_IWGRP) ? 'w' : '-';
+                        perms[6] = (st.st_mode & S_IXGRP) ? 'x' : '-';
+                        perms[7] = (st.st_mode & S_IROTH) ? 'r' : '-';
+                        perms[8] = (st.st_mode & S_IWOTH) ? 'w' : '-';
+                        perms[9] = (st.st_mode & S_IXOTH) ? 'x' : '-';
+        
+                        // link count
+                        string links = to_string(st.st_nlink);
+        
+                        // owner / group
+                        struct passwd *pw = getpwuid(st.st_uid);
+                        struct group  *gr = getgrgid(st.st_gid);
+                        string owner = pw ? pw->pw_name : to_string(st.st_uid);
+                        string group = gr ? gr->gr_name : to_string(st.st_gid);
+        
+                        // size
+                        string size = to_string(st.st_size);
+        
+                        // mtime
+                        char timebuf[64];
+                        struct tm *tm = localtime(&st.st_mtime);
+                        strftime(timebuf, sizeof(timebuf), "%b %d %H:%M", tm);
+        
+                        // assemble line
+                        response += perms; response += ' ';
+                        response += links; response += ' ';
+                        response += owner; response += ' ';
+                        response += group; response += ' ';
+                        response += size;  response += ' ';
+                        response += timebuf; response += ' ';
+                        response += name;  response += '\n';
+                    }
+                }
+                closedir(dir);
+        
+                // send it all at once
+                send(sock, response.c_str(), response.size(), 0);
             }
-            send(sock, response.c_str(), response.size(), 0);
-            // cout<<client_directory<<endl;
         }
 
         else if (command.substr(0, 2) == "cd")
@@ -136,7 +268,7 @@ void *handle_client(void *client_socket)
                     send(sock, "Error changing directory\n", 25, 0);
                 }
             }
-            cout << "Current directory: " << client_directory << endl;
+            // cout << "Current directory: " << client_directory << endl;
         }
 
         else if (command.substr(0, 5) == "chmod")
@@ -194,18 +326,13 @@ void *handle_client(void *client_socket)
                 // cout<<buffer<<endl;
                 send(sock, "Received\n", 8, 0); // Acknowledge receipt of data
                 string data(buffer, bytes);
-                
-
-                
-                if(strcmp(buffer, "EOFEOFEOFEOF") == 0)
-                {
-                    cout << "End of file reached.\n" <<endl;
+                                
+                if(strcmp(buffer, "EOFEOFEOFEOF") == 0){
                     pthread_mutex_unlock(&file_mutex);
                     break;
                 }
                 else if (bytes == 0)
                 {
-                    cout << "End of file reached.\n" <<endl;
                     pthread_mutex_unlock(&file_mutex);
                     break;
                 }
@@ -217,8 +344,7 @@ void *handle_client(void *client_socket)
             }
 
             file.close();
-            cout << "File upload successfully.\n";
-
+            cout << "File uploaded successfully.\n\n";
             pthread_mutex_unlock(&file_mutex);
         }
 
