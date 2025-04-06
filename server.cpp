@@ -112,18 +112,31 @@ void *handle_client(void *client_socket)
         else if (command.substr(0, 2) == "cd")
         {
             string path = command.substr(3);
-            string new_path = client_directory + "/" + path;
+            string candidate = client_directory + "/" + path;
 
-            struct stat statbuf;
-            if (stat(new_path.c_str(), &statbuf) == 0 && S_ISDIR(statbuf.st_mode))
+            char resolved[PATH_MAX];
+            if (realpath(candidate.c_str(), resolved) == nullptr) 
             {
-                client_directory = new_path; // Update client’s working directory
-                send(sock, "Directory changed\n", 18, 0);
-            }
-            else
-            {
+                // realpath failed (e.g. path doesn't exist)
                 send(sock, "Error changing directory\n", 25, 0);
+            } 
+            else 
+            {
+                struct stat st;
+                if (stat(resolved, &st) == 0 && S_ISDIR(st.st_mode)) 
+                {
+                    // Optionally: enforce chroot‑style restriction so clients
+                    // can't escape some “root” directory:
+                    // if (std::string(resolved).rfind(server_root, 0) != 0) { …reject… }
+
+                    client_directory = resolved;
+                    send(sock, "Directory changed\n", 18, 0);
+                } else 
+                {
+                    send(sock, "Error changing directory\n", 25, 0);
+                }
             }
+            cout << "Current directory: " << client_directory << endl;
         }
 
         else if (command.substr(0, 5) == "chmod")
