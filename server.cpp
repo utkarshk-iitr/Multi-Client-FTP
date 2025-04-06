@@ -302,12 +302,12 @@ void *handle_client(void *client_socket)
             ofstream file(filepath, ios::binary);
             if (!file)
             {
-                send(sock, "Error opening file\n", 19, 0);
+                send(sock, "Error opening file", 19, 0);
                 pthread_mutex_unlock(&file_mutex);
                 continue;
             }
 
-            send(sock, "File opened\n", 12, 0);
+            send(sock, "File opened", 12, 0);
 
             // Receive file content
             int total_received = 0;
@@ -324,10 +324,12 @@ void *handle_client(void *client_socket)
 
                 // cout<<"b="<<buffer<<endl;
                 // cout<<buffer<<endl;
-                send(sock, "Received\n", 8, 0); // Acknowledge receipt of data
+                send(sock, "Received", 8, 0); // Acknowledge receipt of data
+                cout<<"Hello"<<endl;
                 string data(buffer, bytes);
-                                
+                
                 if(strcmp(buffer, "EOFEOFEOFEOF") == 0){
+                    memset(buffer, 0, BUFFER_SIZE);
                     pthread_mutex_unlock(&file_mutex);
                     break;
                 }
@@ -336,13 +338,13 @@ void *handle_client(void *client_socket)
                     pthread_mutex_unlock(&file_mutex);
                     break;
                 }
-
+                
                 file.write(buffer, bytes);
                 total_received += bytes;
                 // cout << "Received: " << total_received << " bytes\n";
                 memset(buffer, 0, BUFFER_SIZE);
             }
-
+            
             file.close();
             cout << "File uploaded successfully.\n\n";
             pthread_mutex_unlock(&file_mutex);
