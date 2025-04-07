@@ -9,7 +9,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
-#define SERVER_IP "192.168.0.237"
+#define SERVER_IP "127.0.0.1"
 #define PORT 8080
 #define BUFFER_SIZE 4096
 
@@ -22,8 +22,7 @@ void handle_get(int sock, string filename);
 int main()
 {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock == -1)
-    {
+    if (sock == -1){
         perror("Socket creation failed");
         exit(EXIT_FAILURE);
     }
@@ -33,16 +32,14 @@ int main()
     server_addr.sin_port = htons(PORT);
     server_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
 
-    if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
-    {
+    if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0){
         perror("Connection failed");
         exit(EXIT_FAILURE);
     }
 
     cout << "Connected to FTP server at " << SERVER_IP << ":" << PORT << endl;
 
-    while (true)
-    {
+    while (true){
         cout << "ftp> ";
         string input;
         getline(cin, input);
@@ -52,40 +49,35 @@ int main()
         string command = input.substr(0, input.find(" "));
         string arg = (input.find(" ") != string::npos) ? input.substr(input.find(" ") + 1) : "";
 
-        if (command == "lls")
-        {
+        if (command == "lls"){
             DIR *dir;
             struct dirent *entry;
-            if ((dir = opendir(".")) != NULL)
-            {
-                while ((entry = readdir(dir)) != NULL)
-                {
+            if ((dir = opendir(".")) != NULL){
+                while ((entry = readdir(dir)) != NULL){
                     cout << entry->d_name << endl;
                 }
                 closedir(dir);
             }
-            else
-            {
+
+            else{
                 cout << "Error listing directory\n";
             }
         }
 
-        else if (command == "lcd")
-        {
+        else if (command == "lcd"){
             if (chdir(arg.c_str()) == 0)
                 cout << "Directory changed\n";
             else
                 cout << "Error changing directory\n";
         }
 
-        else if (command == "lchmod")
-        {
+        else if (command == "lchmod"){
             size_t space = arg.find(" ");
-            if (space == string::npos)
-            {
+            if (space == string::npos){
                 cout << "Usage: lchmod <mode> <file>\n";
                 continue;
             }
+
             string mode = arg.substr(0, space);
             string filename = arg.substr(space + 1);
 
@@ -95,25 +87,21 @@ int main()
                 cout << "Error changing permissions\n";
         }
 
-        else if (command == "put")
-        {
+        else if (command == "put"){
             handle_put(sock, arg);
         }
 
-        else if (command == "get")
-        {
+        else if (command == "get"){
             handle_get(sock, arg);
         }
 
-        else if (command == "close")
-        {
+        else if (command == "close"){
             send_command(sock, "close");
             cout << "Closing connection...\n";
             break;
         }
 
-        else
-        {
+        else{
             send_command(sock, input);
         }
     }
@@ -122,8 +110,7 @@ int main()
     return 0;
 }
 
-void send_command(int sock, string command)
-{
+void send_command(int sock, string command){
     char buffer[BUFFER_SIZE];
     send(sock, command.c_str(), command.size(), 0);
     memset(buffer, 0, BUFFER_SIZE);
@@ -131,106 +118,109 @@ void send_command(int sock, string command)
     cout << buffer;
 }
 
-void handle_put(int sock, string filename)
-{
+void handle_put(int sock, string filename){
     ifstream file(filename, ios::binary);
-    if (!file)
-    {
+    if (!file){
         cout << "File not found: " << filename << endl;
         return;
     }
 
-    send_command(sock, "put " + filename);
-    // Get file size
-    file.seekg(0, ios::end);
-    size_t file_size = file.tellg();
-    file.seekg(0, ios::beg);
+    char buffer[BUFFER_SIZE];
+    string command = "put " + filename;
+    send(sock, command.c_str(), command.size(), 0);
+    memset(buffer, 0, BUFFER_SIZE);
+    recv(sock, buffer, BUFFER_SIZE, 0);
 
-    // Send file size first
-    if (send(sock, &file_size, sizeof(file_size), 0) <= 0)
-    {
-        cout << "Error sending file size\n";
-        file.close();
+    if (strcmp(buffer, "ERROR") == 0){
+        cout << "Error opening file" << endl;
         return;
     }
 
-    char buffer[BUFFER_SIZE];
-    size_t total_sent = 0;
+    memset(buffer, 0, BUFFER_SIZE);
+    char buffer2[BUFFER_SIZE];
+    memset(buffer2, 0, BUFFER_SIZE);
 
-    while (file.read(buffer, BUFFER_SIZE) || file.gcount() > 0)
-    {
+    cout<<"Sending..."<<endl;
+    while (file.read(buffer, BUFFER_SIZE) || file.gcount() > 0){
         int bytes_sent = send(sock, buffer, file.gcount(), 0);
-        if (bytes_sent <= 0)
-        {
-            cout << "Error sending file data\n";
+        recv(sock, buffer2, BUFFER_SIZE, 0);
+        // cout<<"Server Acknowledgement: "<<buffer2<<endl;
+
+        if(strcmp(buffer2, "OK") != 0){
+            cout << "Error receiving acknowledgment\n" << endl;
+        }
+        
+        // cout<<"buffer="<<buffer2<<endl;
+        if (bytes_sent <= 0){
+            cout << "Error sending file data\n" <<endl;
             break;
         }
-        total_sent += bytes_sent;
+        memset(buffer2, 0, BUFFER_SIZE);
+        memset(buffer, 0, BUFFER_SIZE);
     }
 
+    send(sock, "EOFEOFEOFEOF\n", 12, 0);
+    recv(sock, buffer2, BUFFER_SIZE, 0);
+
+    if(strcmp(buffer2, "OK") != 0){
+        cout << "Error receiving acknowledgment\n" << endl;
+    }
+    else{
+        cout << "File transfer complete.\n" <<endl;
+    }
     file.close();
-    cout << "File upload complete: " << total_sent << " bytes sent.\n";
 }
 
-void handle_get(int sock, string filename)
-{
+void handle_get(int sock, string filename){
     string command = "get " + filename;
     char buffer[BUFFER_SIZE];
     send(sock, command.c_str(), command.size(), 0);
     memset(buffer, 0, BUFFER_SIZE);
     recv(sock, buffer, BUFFER_SIZE, 0);
 
-    cout << buffer<< endl;
-    memset(buffer, 0, BUFFER_SIZE);
-
-    if (strcmp(buffer, "No such file exists") == 0)
-    {
-        cout << buffer << endl;
+    if (strcmp(buffer, "ERROR") == 0){
+        cout << "No such file exists" << endl;
         return;
     }
+    memset(buffer, 0, BUFFER_SIZE);
 
     ofstream file(filename, ios::binary);
-    if (!file)
-    {
+    if (!file){
         cout << "Error creating file: " << filename << endl;
         return;
     }
 
-    memset(buffer, 0, BUFFER_SIZE);
+    cout<<"Receiving..."<<endl;
     int total_received = 0;
-    while (true)
-    {
+
+    while (true){   
         int bytes = recv(sock, buffer, BUFFER_SIZE, 0);
-        if (bytes <= 0)
-        {
+        if (bytes <= 0){
             cout << "Error receiving file data or connection closed.\n";
             break;
         }
-        
-        cout<<buffer<<endl;
-        send(sock, "Received\n", 8, 0); // Acknowledge receipt of data
-        string data(buffer, bytes);
-        
 
-        
-        if(strcmp(buffer, "EOFEOFEOFEOF") == 0 || total_received >= 1000)
-        {
-            cout << "End of file reached.\n" <<endl;
+        // cout<<"b="<<buffer<<endl;
+        // cout<<buffer<<endl;
+        send(sock, "OK", 2, 0); // Acknowledge receipt of data
+        string data(buffer, bytes);
+                
+        if(strcmp(buffer, "EOFEOFEOFEOF") == 0){
+            // cout << "End of file reached.\n" <<endl;
             break;
         }
-        else if (bytes == 0)
-        {
-            cout << "End of file reached.\n" <<endl;
+        else if (bytes == 0){
+            // cout << "End of file reached.\n" <<endl;
             break;
         }
 
         file.write(buffer, bytes);
         total_received += bytes;
-        cout << "Received: " << total_received << " bytes\n";
+        // cout << "Received: " << total_received << " bytes\n";
         memset(buffer, 0, BUFFER_SIZE);
     }
 
     file.close();
-    cout << "File downloaded successfully.\n";
+    cout << "File downloaded successfully.\n"<<endl;
 }
 
