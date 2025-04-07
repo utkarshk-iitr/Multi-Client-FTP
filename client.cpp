@@ -12,6 +12,9 @@
 #define SERVER_IP "127.0.0.1"
 #define PORT 8080
 #define BUFFER_SIZE 4096
+#define LGREEN "\033[1;32m"
+#define LBLUE "\033[1;34m"
+#define RESET "\033[0m"
 
 using namespace std;
 
@@ -19,8 +22,7 @@ void send_command(int sock, string command);
 void handle_put(int sock, string filename);
 void handle_get(int sock, string filename);
 
-int main()
-{
+int main(){
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == -1){
         perror("Socket creation failed");
@@ -40,7 +42,9 @@ int main()
     cout << "Connected to FTP server at " << SERVER_IP << ":" << PORT << endl;
 
     while (true){
-        cout << "ftp> ";
+        cout <<LGREEN<< "\nftp: "<<LBLUE;
+        send_command(sock, "prompt");
+        cout<<RESET<<" > ";
         string input;
         getline(cin, input);
         if (input.empty())
@@ -97,7 +101,7 @@ int main()
 
         else if (command == "close"){
             send_command(sock, "close");
-            cout << "Closing connection...\n";
+            // cout << "Closing connection...\n";
             break;
         }
 

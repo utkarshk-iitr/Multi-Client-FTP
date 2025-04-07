@@ -12,6 +12,10 @@
 #define PORT 8080
 #define MAX_CLIENTS 8
 #define BUFFER_SIZE 4096
+#define LGREEN "\033[1;32m"
+#define LBLUE "\033[1;34m"
+#define RED "\033[1;31m"
+#define RESET "\033[0m"
 int client_count = 0;
 
 using namespace std;
@@ -19,8 +23,8 @@ using namespace std;
 pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 void *handle_client(void *client_socket);
 
-int main()
-{
+int main(){
+
     int server_fd, client_socket;
     struct sockaddr_in server_addr, client_addr;
     socklen_t addr_len = sizeof(client_addr);
@@ -51,7 +55,7 @@ int main()
         exit(EXIT_FAILURE);
     }
 
-    cout << "FTP Server started on port " << PORT << "...\n";
+    cout << "FTP Server started on port " << PORT << "...\n"<<endl;
 
     while (true){
         client_socket = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
@@ -70,19 +74,18 @@ int main()
     return 0;
 }
 
-void *handle_client(void *client_socket)
-{
+void *handle_client(void *client_socket){
     int sock = *(int *)client_socket;
     char buffer[BUFFER_SIZE];
     string client_directory = ".";
-    cout<<"Clients connected: "<<client_count<<endl<<endl;
+    cout<<LGREEN<<"Clients connected: "<<client_count<<RESET<<endl<<endl;
 
     while (true){
         memset(buffer, 0, BUFFER_SIZE);
         if (recv(sock, buffer, BUFFER_SIZE, 0) <= 0){
-            cout << "Client disconnected.\n";
+            cout << LBLUE<<"Client disconnected.\n";
             client_count--;
-            cout<<"Clients remaining: "<<client_count<<endl<<endl;
+            cout<<"Clients remaining: "<<client_count<<RESET<<endl<<endl;
             close(sock);
             pthread_exit(NULL);
         }
@@ -140,7 +143,6 @@ void *handle_client(void *client_socket)
             else
                 send(sock, "Error changing permissions\n", 27, 0);
         }
-
 
         else if (command.substr(0, 3) == "put"){
             pthread_mutex_lock(&file_mutex);
@@ -238,17 +240,29 @@ void *handle_client(void *client_socket)
             pthread_mutex_unlock(&file_mutex);
         }
 
+        else if (command == "prompt"){
+            char actualpath[PATH_MAX];
+            if (realpath(client_directory.c_str(), actualpath) != NULL) {
+                string response = string(actualpath);
+                send(sock, response.c_str(), response.size(), 0);
+            } 
+
+            else{
+                send(sock,"~", 1, 0);
+            }
+        }
+        
         else if (command == "close"){
-            cout << "Client disconnected.\n";
+            cout <<LBLUE<<"Client disconnected.\n";
             client_count--;
-            cout<<"Clients remaining: "<<client_count<<endl<<endl;
-            send(sock, "Closing connection...\n", 22, 0);
+            cout<<"Clients remaining: "<<client_count<<RESET<<endl<<endl;
+            send(sock, "Closing connection...\n\n", 23, 0);
             close(sock);
             pthread_exit(NULL);
         }
 
         else{
-            cout<<"Invalid command: "<<command<<endl;
+            cout<<RED<<"Invalid command: "<<command<<RESET<<endl<<endl;
             send(sock, "Invalid command\n", 16, 0);
         }
     }
