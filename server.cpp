@@ -9,8 +9,10 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <bits/stdc++.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
 
-#define PORT 8080
+// #define port 8080
 #define MAX_CLIENTS 8
 #define BUFFER_SIZE 4096
 #define LGREEN "\033[1;32m"
@@ -32,7 +34,41 @@ bool is_dir(const string path) {
     return S_ISDIR(path_stat.st_mode);
 }
 
-int main(){
+string getip(){
+    struct ifaddrs *interfaces = nullptr;
+    struct ifaddrs *ifa = nullptr;
+    if (getifaddrs(&interfaces) == -1) {
+        return "-1";
+    }
+    
+    string myip;
+    for (ifa = interfaces; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr) continue;
+        if (ifa->ifa_addr->sa_family == AF_INET) {
+            void* addr_ptr = &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+            char ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, addr_ptr, ip, sizeof(ip));
+            if (string(ip) != "127.0.0.1") myip = ip;
+        }
+    }
+    freeifaddrs(interfaces);
+    return myip;
+}
+
+int main(int argc, char* argv[]){
+
+    if (argc != 2) {
+        cerr << "Usage: ./server <port>" <<endl;
+        return 1;
+    }
+    int port = atoi(argv[1]);
+
+    if (port <= 1024 || port > 65535) { 
+        // Note: Ports below 1025 are often reserved for privileged processes.
+        cerr << "Please provide a valid port number in the range 1025-65535.\n";
+        return 1;
+    }
+
     int server_fd, client_socket;
     struct sockaddr_in server_addr, client_addr;
     socklen_t addr_len = sizeof(client_addr);
@@ -51,7 +87,7 @@ int main(){
 
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
+    server_addr.sin_port = htons(port);
 
     if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0){
         perror("Bind failed");
@@ -63,7 +99,12 @@ int main(){
         exit(EXIT_FAILURE);
     }
 
-    cout << "FTP Server started on port " << PORT << "...\n"<<endl;
+    string myip = getip();
+    if(myip=="-1"){
+        cout<<"Error in getting IP"<<endl;
+        return 0;
+    }
+    cout << "FTP Server started at " << myip<<":"<<port << " ...\n"<<endl;
 
     while (true){
         client_socket = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
@@ -254,9 +295,10 @@ void *handle_client(void *client_socket){
                 int bytes_sent = send(sock, buffer, file.gcount(), 0);
                 memset(buffer2, 0, BUFFER_SIZE);
                 recv(sock, buffer2, BUFFER_SIZE, 0);
-
-                if(strcmp(buffer2, "OK") != 0){
-                    cout << "Error receiving acknowledgment"<<endl;
+                
+                if(strncmp(buffer2,"OK",2)!=0){
+                    cout << "Error receiving acknowledgment"<<buffer2<<endl;
+                    // exit(0);
                 }
                 
                 if (bytes_sent <= 0){
@@ -264,6 +306,7 @@ void *handle_client(void *client_socket){
                     break;
                 }
                 memset(buffer2, 0, BUFFER_SIZE);
+                // cout<<buffer2<<endl;
                 memset(buffer, 0, BUFFER_SIZE);
             }
             
@@ -271,7 +314,7 @@ void *handle_client(void *client_socket){
             memset(buffer2, 0, BUFFER_SIZE);
             recv(sock, buffer2, BUFFER_SIZE, 0);
             if(strcmp(buffer2, "OK") != 0){
-                cout << "Error receiving acknowledgment" <<buffer2<< endl;
+                cout << "Error receiving acknowledgment " <<buffer2<< endl;
             }
             
             cout << "File sending completed.\n"<<endl;
