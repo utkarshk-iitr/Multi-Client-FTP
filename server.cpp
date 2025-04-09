@@ -24,8 +24,15 @@ using namespace std;
 pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 void *handle_client(void *client_socket);
 
-int main(){
+bool is_dir(const string path) {
+    struct stat path_stat;
+    if (stat(path.c_str(), &path_stat) != 0) {
+        return false;
+    }
+    return S_ISDIR(path_stat.st_mode);
+}
 
+int main(){
     int server_fd, client_socket;
     struct sockaddr_in server_addr, client_addr;
     socklen_t addr_len = sizeof(client_addr);
@@ -92,7 +99,7 @@ void *handle_client(void *client_socket){
         }
 
         string command(buffer);
-        command = command.substr(0, command.find("\n")); // Remove newline
+        command = command.substr(0, command.find("\n"));
 
         if (command == "ls"){
             DIR *dir;
@@ -225,6 +232,12 @@ void *handle_client(void *client_socket){
             string filename = command.substr(4);
             string filepath = client_directory + "/" + filename;
 
+            if(is_dir(filepath)){
+                send(sock, "WRONG", 5, 0);
+                pthread_mutex_unlock(&file_mutex);
+                continue;
+            }
+
             ifstream file(filepath, ios::binary);
             if (!file){
                 send(sock, "ERROR", 5, 0);
@@ -246,7 +259,6 @@ void *handle_client(void *client_socket){
                     cout << "Error receiving acknowledgment"<<endl;
                 }
                 
-                // cout<<"buffer="<<buffer2<<endl;
                 if (bytes_sent <= 0){
                     cout << "Error sending file data\n";
                     break;
@@ -254,12 +266,12 @@ void *handle_client(void *client_socket){
                 memset(buffer2, 0, BUFFER_SIZE);
                 memset(buffer, 0, BUFFER_SIZE);
             }
-            // cout<<"sending eof"<<endl;
+            
             send(sock, "EOFEOFEOFEOF", 12, 0);
+            memset(buffer2, 0, BUFFER_SIZE);
             recv(sock, buffer2, BUFFER_SIZE, 0);
-
             if(strcmp(buffer2, "OK") != 0){
-                cout << "Error receiving acknowledgment" << endl;
+                cout << "Error receiving acknowledgment" <<buffer2<< endl;
             }
             
             cout << "File sending completed.\n"<<endl;

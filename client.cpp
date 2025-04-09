@@ -23,6 +23,14 @@ void send_command(int sock, string command);
 void handle_put(int sock, string filename);
 void handle_get(int sock, string filename);
 
+bool is_dir(const string path) {
+    struct stat path_stat;
+    if (stat(path.c_str(), &path_stat) != 0) {
+        return false;
+    }
+    return S_ISDIR(path_stat.st_mode);
+}
+
 int main(){
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == -1){
@@ -106,6 +114,10 @@ int main(){
         }
 
         else if (command == "put"){
+            if(is_dir(arg)){
+                cout << "Error: Cannot upload a directory\n";
+                continue;
+            }
             handle_put(sock, arg);
         }
 
@@ -196,8 +208,12 @@ void handle_get(int sock, string filename){
     memset(buffer, 0, BUFFER_SIZE);
     recv(sock, buffer, BUFFER_SIZE, 0);
 
-    if (strcmp(buffer, "ERROR") == 0){
+    if(strcmp(buffer, "ERROR") == 0){
         cout << "No such file exists" << endl;
+        return;
+    }
+    else if(strcmp(buffer, "WRONG") == 0){
+        cout << "Error: Cannot download a directory" << endl;
         return;
     }
     memset(buffer, 0, BUFFER_SIZE);
@@ -218,23 +234,13 @@ void handle_get(int sock, string filename){
             break;
         }
 
-        // cout<<"b="<<buffer<<endl;
-        // cout<<buffer<<endl;
-        send(sock, "OK", 2, 0); // Acknowledge receipt of data
+        send(sock, "OK", 2, 0);
         string data(buffer, bytes);
                 
-        if(strcmp(buffer, "EOFEOFEOFEOF") == 0){
-            // cout << "End of file reached.\n" <<endl;
-            break;
-        }
-        else if (bytes == 0){
-            // cout << "End of file reached.\n" <<endl;
-            break;
-        }
-
+        if(strcmp(buffer, "EOFEOFEOFEOF") == 0) break;
+        else if (bytes == 0) break;
         file.write(buffer, bytes);
         total_received += bytes;
-        // cout << "Received: " << total_received << " bytes\n";
         memset(buffer, 0, BUFFER_SIZE);
     }
 
