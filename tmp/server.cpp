@@ -227,107 +227,97 @@ void *handle_client(void *client_socket){
             else
                 send(sock, "Error changing permissions\n", 27, 0);
         }
-
-        else if (command.substr(0, 3) == "put"){
+        
+        else if (command.substr(0, 3) == "put") {
             pthread_mutex_lock(&file_mutex);
             string filename = command.substr(4);
             string filepath = client_directory + "/" + filename;
-
+        
             ofstream file(filepath, ios::binary);
-            if (!file){
+            if (!file) {
                 send(sock, "ERROR", 5, 0);
                 pthread_mutex_unlock(&file_mutex);
                 continue;
             }
-
+        
             send(sock, "File opened\n", 12, 0);
-            int total_received = 0;
-            cout<<"Receiving..."<<endl;
-
-            while (true){
-                int bytes = recv(sock, buffer, BUFFER_SIZE, 0);
-                if (bytes <= 0){
-                    cout << "Error receiving file data or connection closed.\n";
-                    pthread_mutex_unlock(&file_mutex);
+            cout << "Receiving..." << endl;
+        
+            while (true) {
+                uint32_t net_chunk_size;
+                int ret = recv(sock, &net_chunk_size, sizeof(net_chunk_size), 0);
+                if (ret != sizeof(net_chunk_size)) {
+                    cout << "Error receiving chunk size" << endl;
                     break;
                 }
-
-                send(sock, "OK\n", 3, 0);
-                string data(buffer, bytes);
-                                
-                if(strcmp(buffer, "EOFEOFEOFEOF") == 0){
-                    // cout << "End of file reached.\n" <<endl;
-                    pthread_mutex_unlock(&file_mutex);
+                uint32_t chunk_size = ntohl(net_chunk_size);
+                // Zero length signals EOF
+                if (chunk_size == 0)
                     break;
+        
+                int total_received = 0;
+                char buffer[BUFFER_SIZE];
+                while (total_received < (int)chunk_size) {
+                    int bytes = recv(sock, buffer, min(BUFFER_SIZE, (int)(chunk_size - total_received)), 0);
+                    if (bytes <= 0) {
+                        cout << "Error receiving file data" << endl;
+                        break;
+                    }
+                    file.write(buffer, bytes);
+                    total_received += bytes;
                 }
-                else if (bytes == 0){
-                    // cout << "End of file reached.\n" <<endl;
-                    pthread_mutex_unlock(&file_mutex);
-                    break;
-                }
-
-                file.write(buffer, bytes);
-                total_received += bytes;
-                // cout << "Received: " << total_received << " bytes\n";
-                memset(buffer, 0, BUFFER_SIZE);
             }
-
+        
             file.close();
-            cout << "File recieved successfully.\n"<<endl;
+            cout << "File received successfully." << endl;
             pthread_mutex_unlock(&file_mutex);
         }
-
-        else if (command.substr(0, 3) == "get"){
+        
+        else if (command.substr(0, 3) == "get") {
             pthread_mutex_lock(&file_mutex);
             string filename = command.substr(4);
             string filepath = client_directory + "/" + filename;
-
-            if(is_dir(filepath)){
+        
+            if (is_dir(filepath)) {
                 send(sock, "WRONG", 5, 0);
                 pthread_mutex_unlock(&file_mutex);
                 continue;
             }
-
+        
             ifstream file(filepath, ios::binary);
-            if (!file){
+            if (!file) {
                 send(sock, "ERROR", 5, 0);
                 pthread_mutex_unlock(&file_mutex);
                 continue;
             }
-
+        
             send(sock, "File opened\n", 12, 0);
+            cout << "Sending..." << endl;
             char buffer[BUFFER_SIZE];
-            char buffer2[BUFFER_SIZE];
-
-            cout<<"Sending..."<<endl;
-            while (file.read(buffer, BUFFER_SIZE) || file.gcount() > 0){
-                int bytes_sent = send(sock, buffer, file.gcount(), 0);
-                memset(buffer2, 0, BUFFER_SIZE);                
-                if(read_ack(sock) != "OK"){
-                    cout << "Error receiving acknowledgment"<<buffer2<<endl;
-                    // exit(0);
-                }
+            while (file.read(buffer, BUFFER_SIZE) || file.gcount() > 0) {
+                uint32_t chunk_size = file.gcount();
+                uint32_t net_chunk_size = htonl(chunk_size);
                 
-                if (bytes_sent <= 0){
-                    cout << "Error sending file data\n";
+                // Send the chunk size first
+                if (send(sock, &net_chunk_size, sizeof(net_chunk_size), 0) != sizeof(net_chunk_size)) {
+                    cout << "Error sending chunk size" << endl;
                     break;
                 }
-                memset(buffer2, 0, BUFFER_SIZE);
-                // cout<<buffer2<<endl;
-                memset(buffer, 0, BUFFER_SIZE);
+                // Then send the actual chunk
+                if (send(sock, buffer, chunk_size, 0) != (int)chunk_size) {
+                    cout << "Error sending file data" << endl;
+                    break;
+                }
             }
-            
-            send(sock, "EOFEOFEOFEOF", 12, 0);
-            memset(buffer2, 0, BUFFER_SIZE);
-            if(read_ack(sock) != "OK"){
-                cout << "Error receiving acknowledgment " <<buffer2<< endl;
-            }
-            
-            cout << "File sending completed.\n"<<endl;
+            // Send a zero-length header to indicate file end
+            uint32_t zero = 0;
+            zero = htonl(zero);
+            send(sock, &zero, sizeof(zero), 0);
+            cout << "File sending completed." << endl;
             file.close();
             pthread_mutex_unlock(&file_mutex);
         }
-
+        
         else if (command == "prompt"){
             char actualpath[PATH_MAX];
             if (realpath(client_directory.c_str(), actualpath) != NULL) {
