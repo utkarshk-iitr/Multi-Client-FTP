@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <bits/stdc++.h>
 
 #define PORT 8080
 #define MAX_CLIENTS 8
@@ -96,19 +97,45 @@ void *handle_client(void *client_socket){
         if (command == "ls"){
             DIR *dir;
             struct dirent *entry;
-            string response = "";
+            vector<string> response;
+            string ans= "";
 
             if ((dir = opendir(client_directory.c_str())) != NULL){
                 while ((entry = readdir(dir)) != NULL){
-                    response += string(entry->d_name) + "\n";
+                    response.push_back(string(entry->d_name));
                 }
                 closedir(dir);
             }
-
             else{
-                response = "Error opening directory\n";
+                ans = "Error opening directory\n";
+                send(sock, ans.c_str(), ans.size(), 0);
+                continue;
             }
-            send(sock, response.c_str(), response.size(), 0);
+
+            sort(response.begin(), response.end());
+            for (const auto &file : response){
+                if (file != "." && file != ".."){
+                    ans += file + "\n";
+                }
+            }
+            send(sock, ans.c_str(), ans.size(), 0);
+        }
+
+        else if (command == "help"){
+            string help_message = "Welcome to the FTP server!\n\n"
+                                  "Available server commands:\n"
+                                  "ls - List files in the current directory\n"
+                                  "cd <directory> - Change directory\n"
+                                  "chmod <mode> <file> - Change file permissions\n"
+                                  "put <file> - Upload a file\n"
+                                  "get <file> - Download a file\n"
+                                  "close - Disconnect from server\n\n"
+                                  "help - To view this help message\n\n"
+                                  "Available client commands:\n"
+                                  "lls - List files in the local directory\n"
+                                  "lcd <directory> - Change local directory\n"
+                                  "lchmod <mode> <file> - Change local file permissions\n";
+            send(sock, help_message.c_str(), help_message.size(), 0);
         }
 
         else if (command.substr(0, 2) == "cd"){
@@ -212,11 +239,11 @@ void *handle_client(void *client_socket){
             cout<<"Sending..."<<endl;
             while (file.read(buffer, BUFFER_SIZE) || file.gcount() > 0){
                 int bytes_sent = send(sock, buffer, file.gcount(), 0);
+                memset(buffer2, 0, BUFFER_SIZE);
                 recv(sock, buffer2, BUFFER_SIZE, 0);
-                // cout<<"Client Acknowledgement: "<<buffer2<<endl;
 
                 if(strcmp(buffer2, "OK") != 0){
-                    cout << "Error receiving acknowledgment\n" << endl;
+                    cout << "Error receiving acknowledgment"<<endl;
                 }
                 
                 // cout<<"buffer="<<buffer2<<endl;
@@ -228,11 +255,11 @@ void *handle_client(void *client_socket){
                 memset(buffer, 0, BUFFER_SIZE);
             }
             // cout<<"sending eof"<<endl;
-            send(sock, "EOFEOFEOFEOF\n", 12, 0);
+            send(sock, "EOFEOFEOFEOF", 12, 0);
             recv(sock, buffer2, BUFFER_SIZE, 0);
 
             if(strcmp(buffer2, "OK") != 0){
-                cout << "Error receiving acknowledgment\n" << endl;
+                cout << "Error receiving acknowledgment" << endl;
             }
             
             cout << "File sending completed.\n"<<endl;

@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <bits/stdc++.h>
 
 #define SERVER_IP "127.0.0.1"
 #define PORT 8080
@@ -56,17 +57,30 @@ int main(){
         if (command == "lls"){
             DIR *dir;
             struct dirent *entry;
+            vector<string> response;
+
             if ((dir = opendir(".")) != NULL){
                 while ((entry = readdir(dir)) != NULL){
-                    cout << entry->d_name << endl;
+                    response.push_back(string(entry->d_name));
                 }
                 closedir(dir);
             }
-
             else{
                 cout << "Error listing directory\n";
+                continue;
+            }
+
+            sort(response.begin(), response.end());
+            for (const auto &file : response){
+                if (file != "." && file != ".."){
+                    cout<<file<<endl;
+                }
             }
         }
+
+        else if (command == "help"){
+            send_command(sock, "help");
+        }     
 
         else if (command == "lcd"){
             if (chdir(arg.c_str()) == 0)
@@ -170,7 +184,7 @@ void handle_put(int sock, string filename){
         cout << "Error receiving acknowledgment\n" << endl;
     }
     else{
-        cout << "File transfer complete.\n" <<endl;
+        cout << "File transfer complete"<<endl;
     }
     file.close();
 }
@@ -225,6 +239,6 @@ void handle_get(int sock, string filename){
     }
 
     file.close();
-    cout << "File downloaded successfully.\n"<<endl;
+    cout << "File downloaded successfully"<<endl;
 }
 
