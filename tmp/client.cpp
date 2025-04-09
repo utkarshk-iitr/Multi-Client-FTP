@@ -212,15 +212,21 @@ void handle_put(int sock, string filename) {
 void handle_get(int sock, string filename) {
     string command = "get " + filename;
     send(sock, command.c_str(), command.size(), 0);
+
     char buffer[BUFFER_SIZE];
     memset(buffer, 0, BUFFER_SIZE);
-    recv(sock, buffer, BUFFER_SIZE, 0);
+    // Receive initial server response (e.g. "File opened\n")
+    int ret = recv(sock, buffer, BUFFER_SIZE, 0);
+    if (ret <= 0) {
+        cout << "Connection closed or error occurred." << endl;
+        return;
+    }
     
-    if (strcmp(buffer, "ERROR") == 0) {
+    if (strncmp(buffer, "ERROR", 5) == 0) {
         cout << "No such file exists" << endl;
         return;
     } 
-    else if (strcmp(buffer, "WRONG") == 0) {
+    else if (strncmp(buffer, "WRONG", 5) == 0) {
         cout << "Error: Cannot download a directory" << endl;
         return;
     }
@@ -232,30 +238,44 @@ void handle_get(int sock, string filename) {
     }
     
     cout << "Receiving..." << endl;
+    
+    // Loop to receive each chunk size header then the chunk data.
     while (true) {
         uint32_t net_chunk_size;
-        // Receive the 4-byte header for the chunk size
-        int ret = recv(sock, &net_chunk_size, sizeof(net_chunk_size), 0);
-        if (ret != sizeof(net_chunk_size)) {
-            cout << "Error receiving chunk size" << endl;
+        // Read the 4-byte header for the chunk size
+        int header_bytes = 0;
+        char* header_ptr = reinterpret_cast<char*>(&net_chunk_size);
+        while (header_bytes < sizeof(net_chunk_size)) {
+            int n = recv(sock, header_ptr + header_bytes, sizeof(net_chunk_size) - header_bytes, 0);
+            if (n <= 0) {
+                cout << "Error receiving chunk size (connection closed?)" << endl;
+                file.close();
+                return;
+            }
+            header_bytes += n;
+        }
+        uint32_t chunk_size = ntohl(net_chunk_size);  // Convert from network to host byte order
+        
+        // A header of 0 means end-of-file
+        if (chunk_size == 0) {
             break;
         }
-        uint32_t chunk_size = ntohl(net_chunk_size);  // Convert to host byte order
-        // Check for end-of-file signal
-        if (chunk_size == 0)
-            break;
             
         int total_received = 0;
+        // Ensure we receive exactly chunk_size bytes for this chunk
         while (total_received < (int)chunk_size) {
-            int bytes = recv(sock, buffer, min(BUFFER_SIZE, (int)(chunk_size - total_received)), 0);
+            int to_read = min(BUFFER_SIZE, (int)(chunk_size - total_received));
+            int bytes = recv(sock, buffer, to_read, 0);
             if (bytes <= 0) {
                 cout << "Error receiving file data or connection closed." << endl;
-                break;
+                file.close();
+                return;
             }
             file.write(buffer, bytes);
             total_received += bytes;
         }
     }
+    
     file.close();
     cout << "File downloaded successfully" << endl;
 }
