@@ -55,18 +55,7 @@ string getip(){
     return myip;
 }
 
-string read_ack(int sock) {
-    string ack = "";
-    char ch;
-    while (recv(sock, &ch, 1, 0) == 1) {
-        if (ch == '\n') break;
-        ack += ch;
-    }
-    return ack;
-}
-
 int main(int argc, char* argv[]){
-
     if (argc != 2) {
         cerr << "Usage: ./server <port>" <<endl;
         return 1;
