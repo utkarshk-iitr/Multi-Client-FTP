@@ -2,6 +2,7 @@
 #include <fstream>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint> 
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -10,8 +11,6 @@
 #include <sys/stat.h>
 #include <bits/stdc++.h>
 
-#define SERVER_IP "127.0.0.1"
-#define PORT 8080
 #define BUFFER_SIZE 4096
 #define LGREEN "\033[1;32m"
 #define LBLUE "\033[1;34m"
@@ -31,7 +30,15 @@ bool is_dir(const string path) {
     return S_ISDIR(path_stat.st_mode);
 }
 
-int main(){
+int main(int argc, char *argv[]){
+    if(argc != 3){
+        cout << "Usage: ./client <server_ip> <port>" << endl;
+        return 1;
+    }
+
+    char* SERVER_IP = argv[1];
+    int PORT = atoi(argv[2]);
+
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == -1){
         perror("Socket creation failed");
@@ -127,7 +134,6 @@ int main(){
 
         else if (command == "close"){
             send_command(sock, "close");
-            // cout << "Closing connection...\n";
             break;
         }
 
@@ -148,103 +154,113 @@ void send_command(int sock, string command){
     cout << buffer;
 }
 
-void handle_put(int sock, string filename){
+void handle_put(int sock, string filename) {
     ifstream file(filename, ios::binary);
-    if (!file){
+    if (!file) {
         cout << "File not found: " << filename << endl;
         return;
     }
-
-    char buffer[BUFFER_SIZE];
+    
     string command = "put " + filename;
     send(sock, command.c_str(), command.size(), 0);
+    
+    char buffer[BUFFER_SIZE];
     memset(buffer, 0, BUFFER_SIZE);
     recv(sock, buffer, BUFFER_SIZE, 0);
-
-    if (strcmp(buffer, "ERROR") == 0){
+    if (strcmp(buffer, "ERROR") == 0) {
         cout << "Error opening file" << endl;
         return;
     }
-
-    memset(buffer, 0, BUFFER_SIZE);
-    char buffer2[BUFFER_SIZE];
-    memset(buffer2, 0, BUFFER_SIZE);
-
-    cout<<"Sending..."<<endl;
-    while (file.read(buffer, BUFFER_SIZE) || file.gcount() > 0){
-        int bytes_sent = send(sock, buffer, file.gcount(), 0);
-        recv(sock, buffer2, BUFFER_SIZE, 0);
-        // cout<<"Server Acknowledgement: "<<buffer2<<endl;
-
-        if(strcmp(buffer2, "OK") != 0){
-            cout << "Error receiving acknowledgment\n" << endl;
-        }
+    
+    cout << "Sending..." << endl;
+    while (file.read(buffer, BUFFER_SIZE) || file.gcount() > 0) {
+        uint32_t chunk_size = file.gcount();
+        uint32_t net_chunk_size = htonl(chunk_size);
         
-        // cout<<"buffer="<<buffer2<<endl;
-        if (bytes_sent <= 0){
-            cout << "Error sending file data\n" <<endl;
+        if (send(sock, &net_chunk_size, sizeof(net_chunk_size), 0) != sizeof(net_chunk_size)) {
+            cout << "Error sending chunk size" << endl;
             break;
         }
-        memset(buffer2, 0, BUFFER_SIZE);
-        memset(buffer, 0, BUFFER_SIZE);
+        if (send(sock, buffer, chunk_size, 0) != (int)chunk_size) {
+            cout << "Error sending file data" << endl;
+            break;
+        }
     }
-
-    send(sock, "EOFEOFEOFEOF\n", 12, 0);
-    recv(sock, buffer2, BUFFER_SIZE, 0);
-
-    if(strcmp(buffer2, "OK") != 0){
-        cout << "Error receiving acknowledgment\n" << endl;
-    }
-    else{
-        cout << "File transfer complete"<<endl;
-    }
+    // Send a final header with 0 length to signal end of file
+    uint32_t zero = 0;
+    zero = htonl(zero);
+    send(sock, &zero, sizeof(zero), 0);
+    cout << "File transfer complete" << endl;
     file.close();
-}
+}  
 
-void handle_get(int sock, string filename){
+void handle_get(int sock, string filename) {
     string command = "get " + filename;
-    char buffer[BUFFER_SIZE];
     send(sock, command.c_str(), command.size(), 0);
-    memset(buffer, 0, BUFFER_SIZE);
-    recv(sock, buffer, BUFFER_SIZE, 0);
 
-    if(strcmp(buffer, "ERROR") == 0){
-        cout << "No such file exists" << endl;
+    char buffer[BUFFER_SIZE];
+    memset(buffer, 0, BUFFER_SIZE);
+    // Receive initial server response (e.g. "File opened\n")
+    int ret = recv(sock, buffer, BUFFER_SIZE, 0);
+    if (ret <= 0) {
+        cout << "Connection closed or error occurred." << endl;
         return;
     }
-    else if(strcmp(buffer, "WRONG") == 0){
+    
+    if (strncmp(buffer, "ERROR", 5) == 0) {
+        cout << "No such file exists" << endl;
+        return;
+    } 
+    else if (strncmp(buffer, "WRONG", 5) == 0) {
         cout << "Error: Cannot download a directory" << endl;
         return;
     }
-    memset(buffer, 0, BUFFER_SIZE);
-
+    
     ofstream file(filename, ios::binary);
-    if (!file){
+    if (!file) {
         cout << "Error creating file: " << filename << endl;
         return;
     }
-
-    cout<<"Receiving..."<<endl;
-    int total_received = 0;
-
-    while (true){   
-        int bytes = recv(sock, buffer, BUFFER_SIZE, 0);
-        if (bytes <= 0){
-            cout << "Error receiving file data or connection closed.\n";
+    
+    cout << "Receiving..." << endl;
+    
+    // Loop to receive each chunk size header then the chunk data.
+    while (true) {
+        uint32_t net_chunk_size;
+        // Read the 4-byte header for the chunk size
+        int header_bytes = 0;
+        char* header_ptr = reinterpret_cast<char*>(&net_chunk_size);
+        while (header_bytes < sizeof(net_chunk_size)) {
+            int n = recv(sock, header_ptr + header_bytes, sizeof(net_chunk_size) - header_bytes, 0);
+            if (n <= 0) {
+                cout << "Error receiving chunk size (connection closed?)" << endl;
+                file.close();
+                return;
+            }
+            header_bytes += n;
+        }
+        uint32_t chunk_size = ntohl(net_chunk_size);  // Convert from network to host byte order
+        
+        // A header of 0 means end-of-file
+        if (chunk_size == 0) {
             break;
         }
-
-        send(sock, "OK", 2, 0);
-        string data(buffer, bytes);
-                
-        if(strcmp(buffer, "EOFEOFEOFEOF") == 0) break;
-        else if (bytes == 0) break;
-        file.write(buffer, bytes);
-        total_received += bytes;
-        memset(buffer, 0, BUFFER_SIZE);
+            
+        int total_received = 0;
+        // Ensure we receive exactly chunk_size bytes for this chunk
+        while (total_received < (int)chunk_size) {
+            int to_read = min(BUFFER_SIZE, (int)(chunk_size - total_received));
+            int bytes = recv(sock, buffer, to_read, 0);
+            if (bytes <= 0) {
+                cout << "Error receiving file data or connection closed." << endl;
+                file.close();
+                return;
+            }
+            file.write(buffer, bytes);
+            total_received += bytes;
+        }
     }
-
+    
     file.close();
-    cout << "File downloaded successfully"<<endl;
+    cout << "File downloaded successfully" << endl;
 }
-
