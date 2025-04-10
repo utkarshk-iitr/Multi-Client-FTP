@@ -55,6 +55,28 @@ string getip(){
     return myip;
 }
 
+bool send_all(int sock, const void* buf, size_t len) {
+    const char* p = static_cast<const char*>(buf);
+    while (len > 0) {
+        int bytes = send(sock, p, len, 0);
+        if (bytes <= 0) return false;
+        p += bytes;
+        len -= bytes;
+    }
+    return true;
+}
+
+bool recv_all(int sock, void* buf, size_t len) {
+    char* p = static_cast<char*>(buf);
+    while (len > 0) {
+        int bytes = recv(sock, p, len, 0);
+        if (bytes <= 0) return false;
+        p += bytes;
+        len -= bytes;
+    }
+    return true;
+}
+
 int main(int argc, char* argv[]){
     if (argc != 2) {
         cerr << "Usage: ./server <port>" <<endl;
@@ -221,44 +243,48 @@ void *handle_client(void *client_socket){
             pthread_mutex_lock(&file_mutex);
             string filename = command.substr(4);
             string filepath = client_directory + "/" + filename;
-        
+            
             ofstream file(filepath, ios::binary);
             if (!file) {
                 send(sock, "ERROR", 5, 0);
                 pthread_mutex_unlock(&file_mutex);
                 continue;
             }
-        
-            send(sock, "File opened\n", 12, 0);
-            cout << "Receiving..." << endl;
-        
+            
+            send(sock, "OK", 2, 0);
+            const uint32_t ERROR_SIGNAL = 0xFFFFFFFF;
+            cout<<"Recieving "<<filename<<" ..."<<endl;
+            
+            int p = 1;
             while (true) {
                 uint32_t net_chunk_size;
-                int ret = recv(sock, &net_chunk_size, sizeof(net_chunk_size), 0);
-                if (ret != sizeof(net_chunk_size)) {
-                    cout << "Error receiving chunk size" << endl;
+                if (!recv_all(sock, &net_chunk_size, sizeof(net_chunk_size))) {
+                    cerr << "Header error" << endl;
+                    p = 0;
                     break;
                 }
+                
                 uint32_t chunk_size = ntohl(net_chunk_size);
-                // Zero length signals EOF
-                if (chunk_size == 0)
+                if (chunk_size == ERROR_SIGNAL) {
+                    cerr << "Client aborted transfer" << endl;
+                    p = 0;
                     break;
-        
-                int total_received = 0;
-                char buffer[BUFFER_SIZE];
-                while (total_received < (int)chunk_size) {
-                    int bytes = recv(sock, buffer, min(BUFFER_SIZE, (int)(chunk_size - total_received)), 0);
-                    if (bytes <= 0) {
-                        cout << "Error receiving file data" << endl;
-                        break;
-                    }
-                    file.write(buffer, bytes);
-                    total_received += bytes;
                 }
+                if (chunk_size == 0) break;  // EOF
+                
+                vector<char> buffer(chunk_size);
+                if (!recv_all(sock, buffer.data(), chunk_size)) {
+                    uint32_t net_err = htonl(ERROR_SIGNAL);
+                    send_all(sock, &net_err, sizeof(net_err));
+                    cerr << "Chunk error" << endl;
+                    p = 0;
+                    break;
+                }
+                file.write(buffer.data(), chunk_size);
             }
-        
+            
             file.close();
-            cout << "File received successfully." << endl;
+            if(p) cout<<"File recieved successfully\n"<<endl;
             pthread_mutex_unlock(&file_mutex);
         }
         
@@ -266,44 +292,36 @@ void *handle_client(void *client_socket){
             pthread_mutex_lock(&file_mutex);
             string filename = command.substr(4);
             string filepath = client_directory + "/" + filename;
-        
-            if (is_dir(filepath)) {
-                send(sock, "WRONG", 5, 0);
-                pthread_mutex_unlock(&file_mutex);
-                continue;
-            }
-        
+            
             ifstream file(filepath, ios::binary);
             if (!file) {
                 send(sock, "ERROR", 5, 0);
                 pthread_mutex_unlock(&file_mutex);
                 continue;
             }
-        
-            send(sock, "File opened\n", 12, 0);
-            cout << "Sending..." << endl;
+            
+            send(sock, "OK", 2, 0);
+            const uint32_t ERROR_SIGNAL = 0xFFFFFFFF;
             char buffer[BUFFER_SIZE];
+            cout<<"Sending "<<filename<<" ..."<<endl;
+
             while (file.read(buffer, BUFFER_SIZE) || file.gcount() > 0) {
                 uint32_t chunk_size = file.gcount();
                 uint32_t net_chunk_size = htonl(chunk_size);
                 
-                // Send the chunk size first
-                if (send(sock, &net_chunk_size, sizeof(net_chunk_size), 0) != sizeof(net_chunk_size)) {
-                    cout << "Error sending chunk size" << endl;
-                    break;
-                }
-                // Then send the actual chunk
-                if (send(sock, buffer, chunk_size, 0) != (int)chunk_size) {
-                    cout << "Error sending file data" << endl;
+                if (!send_all(sock, &net_chunk_size, sizeof(net_chunk_size)) || 
+                    !send_all(sock, buffer, chunk_size)) {
+                    uint32_t net_err = htonl(ERROR_SIGNAL);
+                    send_all(sock, &net_err, sizeof(net_err));
                     break;
                 }
             }
-            // Send a zero-length header to indicate file end
+            
             uint32_t zero = 0;
             zero = htonl(zero);
-            send(sock, &zero, sizeof(zero), 0);
-            cout << "File sending completed." << endl;
+            send_all(sock, &zero, sizeof(zero));
             file.close();
+            cout<<"File sent successfully\n"<<endl;
             pthread_mutex_unlock(&file_mutex);
         }
         

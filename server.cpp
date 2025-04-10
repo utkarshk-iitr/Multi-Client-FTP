@@ -24,6 +24,7 @@ int client_count = 0;
 using namespace std;
 
 pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_rwlock_t file_rwlock = PTHREAD_RWLOCK_INITIALIZER; // Instead of pthread_mutex_t
 void *handle_client(void *client_socket);
 
 bool is_dir(const string path) {
@@ -48,7 +49,10 @@ string getip(){
             void* addr_ptr = &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
             char ip[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, addr_ptr, ip, sizeof(ip));
-            if (string(ip) != "127.0.0.1") myip = ip;
+            if (string(ip) != "127.0.0.1"){
+                myip = ip;
+                break;
+            }
         }
     }
     freeifaddrs(interfaces);
@@ -218,7 +222,8 @@ void *handle_client(void *client_socket){
         }
         
         else if (command.substr(0, 3) == "put") {
-            pthread_mutex_lock(&file_mutex);
+            // pthread_mutex_lock(&file_mutex);
+            pthread_rwlock_rdlock(&file_rwlock);
             string filename = command.substr(4);
             string filepath = client_directory + "/" + filename;
         
@@ -259,11 +264,13 @@ void *handle_client(void *client_socket){
         
             file.close();
             cout << "File received successfully." << endl;
-            pthread_mutex_unlock(&file_mutex);
+            pthread_rwlock_unlock(&file_rwlock);
+            // pthread_mutex_unlock(&file_mutex);
         }
         
         else if (command.substr(0, 3) == "get") {
-            pthread_mutex_lock(&file_mutex);
+            // pthread_mutex_lock(&file_mutex);
+            pthread_rwlock_rdlock(&file_rwlock);
             string filename = command.substr(4);
             string filepath = client_directory + "/" + filename;
         
@@ -304,7 +311,8 @@ void *handle_client(void *client_socket){
             send(sock, &zero, sizeof(zero), 0);
             cout << "File sending completed." << endl;
             file.close();
-            pthread_mutex_unlock(&file_mutex);
+            pthread_rwlock_unlock(&file_rwlock);
+            // pthread_mutex_unlock(&file_mutex);
         }
         
         else if (command == "prompt"){
