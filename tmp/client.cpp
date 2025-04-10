@@ -30,17 +30,6 @@ bool is_dir(const string path) {
     return S_ISDIR(path_stat.st_mode);
 }
 
-string read_ack(int sock) {
-    string ack = "";
-    char ch;
-    while (recv(sock, &ch, 1, 0) == 1) {
-        if (ch == '\n') break;
-        ack += ch;
-    }
-    return ack;
-}
-
-
 int main(int argc, char *argv[]){
     if(argc != 3){
         cout << "Usage: ./client <server_ip> <port>" << endl;
@@ -145,7 +134,6 @@ int main(int argc, char *argv[]){
 
         else if (command == "close"){
             send_command(sock, "close");
-            // cout << "Closing connection...\n";
             break;
         }
 
@@ -173,7 +161,6 @@ void handle_put(int sock, string filename) {
         return;
     }
     
-    // Inform the server of the command (unchanged)
     string command = "put " + filename;
     send(sock, command.c_str(), command.size(), 0);
     
