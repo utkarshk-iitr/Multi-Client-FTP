@@ -17,6 +17,30 @@
 #define RESET "\033[0m"
 
 using namespace std;
+void send_commandls(int sock, const std::string &command) {
+    char buffer[BUFFER_SIZE];
+    send(sock, command.c_str(), command.size(), 0);
+
+    std::string completeResponse;
+    int bytes_received = 0;
+    bool done = false;
+
+    // Read until we receive our custom "EOF" marker.
+    while (!done && (bytes_received = recv(sock, buffer, BUFFER_SIZE - 1, 0)) > 0) {
+        buffer[bytes_received] = '\0';
+        completeResponse += buffer;
+
+        // Check if EOF marker is present
+        if (completeResponse.find("EOF\n") != std::string::npos) {
+            done = true;
+            // Optionally remove the EOF marker from the output:
+            completeResponse = completeResponse.substr(0, completeResponse.find("EOF\n"));
+        }
+    }
+
+    std::cout << completeResponse;
+}
+
 
 void send_command(int sock, string command);
 void handle_put(int sock, string filename);
@@ -81,7 +105,7 @@ int main(int argc, char *argv[]){
 
     while (true){
         cout <<LGREEN<< "\nftp: "<<LBLUE;
-        send_command(sock, "prompt");
+        send_command(sock, "pwd");
         cout<<RESET<<" > ";
         string input;
         getline(cin, input);
@@ -124,6 +148,29 @@ int main(int argc, char *argv[]){
                 cout << "Directory changed\n";
             else
                 cout << "Error changing directory\n";
+        }else if(command == "lpwd"){
+            char cwd[PATH_MAX];
+            if (getcwd(cwd, sizeof(cwd)) != NULL) {
+                cout << "Current directory: " << cwd << endl;
+            } else {
+                perror("getcwd() error");
+            }
+        }
+
+        else if (command == "lchmod"){
+            size_t space = arg.find(" ");
+            if (space == string::npos){
+                cout << "Usage: lchmod <mode> <file>\n";
+                continue;
+            }
+
+            string mode = arg.substr(0, space);
+            string filename = arg.substr(space + 1);
+
+            if (chmod(filename.c_str(), stoi(mode, nullptr, 8)) == 0)
+                cout << "Permissions changed\n";
+            else
+                cout << "Error changing permissions\n";
         }
 
         else if (command == "lchmod"){
@@ -158,6 +205,9 @@ int main(int argc, char *argv[]){
             send_command(sock, "close");
             break;
         }
+        else if(command=="ls"){
+            send_commandls(sock,"ls");
+        }
 
         else{
             send_command(sock, input);
@@ -176,11 +226,12 @@ void send_command(int sock, string command){
     cout << buffer;
 }
 
+
 void handle_put(int sock, string filename) {
     ifstream file(filename, ios::binary);
     if (!file) {
         cout << "File not found: " << filename << endl;
-        send(sock, "ERROR", 5, 0);  // Notify server
+        // send(sock, "ERROR", 5, 0);  // Notify server
         return;
     }
     
@@ -231,10 +282,10 @@ void handle_get(int sock, string filename) {
     string command = "get " + filename;
     send(sock, command.c_str(), command.size(), 0);
 
-    char response[BUFFER_SIZE];
-    recv(sock, response, BUFFER_SIZE, 0);
-    if (strncmp(response, "ERROR", 5) == 0) {
-        cout << "File not found on server" << endl;
+    // Read exactly 2 bytes to check for "OK"
+    char ok[2];
+    if (!recv_all(sock, ok, 2) || strncmp(ok, "OK", 2) != 0) {
+        cout << "File not found on server or bad response." << endl;
         return;
     }
 
@@ -243,36 +294,54 @@ void handle_get(int sock, string filename) {
         cout << "Local file error" << endl;
         return;
     }
-    
-    cout<<"Recieving "<<filename<<" ..."<<endl;
+
+    cout << "Receiving " << filename << " ...\n";
+
     const uint32_t ERROR_SIGNAL = 0xFFFFFFFF;
-    int  p = 1;
+    char buffer[BUFFER_SIZE];
+    int status = 1;
 
     while (true) {
         uint32_t net_chunk_size;
         if (!recv_all(sock, &net_chunk_size, sizeof(net_chunk_size))) {
-            cout << "Connection lost" << endl;
-            p = 0;
+            cout << "Connection lost\n";
+            status = 0;
             break;
         }
 
         uint32_t chunk_size = ntohl(net_chunk_size);
-        if (chunk_size == ERROR_SIGNAL) {
-            cout << "Server reported error" << endl;
-            p = 0;
-            break;
-        }
-        if (chunk_size == 0) break;  // EOF
 
-        vector<char> buffer(chunk_size);
-        if (!recv_all(sock, buffer.data(), chunk_size)) {
-            cout << "Incomplete chunk" << endl;
-            p = 0; 
+        if (chunk_size == ERROR_SIGNAL) {
+            cout << "Server reported error\n";
+            status = 0;
             break;
         }
-        file.write(buffer.data(), chunk_size);
+
+        if (chunk_size == 0) break; // EOF
+
+        if (chunk_size > BUFFER_SIZE) {
+            cout << "Received chunk size too big, possible corruption\n";
+            status = 0;
+            break;
+        }
+
+        if (!recv_all(sock, buffer, chunk_size)) {
+            cout << "Incomplete chunk received\n";
+            status = 0;
+            break;
+        }
+
+        file.write(buffer, chunk_size);
+        if (!file) {
+            cout << "File write error\n";
+            status = 0;
+            break;
+        }
+
+        // Optional debug
+        // cout << "Received chunk of size: " << chunk_size << endl;
     }
 
-    if(p) cout << "File downloaded" << endl;
     file.close();
+    if (status) cout << "File downloaded successfully\n";
 }

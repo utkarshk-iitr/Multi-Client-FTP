@@ -162,32 +162,27 @@ void *handle_client(void *client_socket){
         string command(buffer);
         command = command.substr(0, command.find("\n"));
 
-        if (command == "ls"){
-            DIR *dir;
-            struct dirent *entry;
-            vector<string> response;
-            string ans= "";
-
-            if ((dir = opendir(client_directory.c_str())) != NULL){
-                while ((entry = readdir(dir)) != NULL){
-                    response.push_back(string(entry->d_name));
+            if (command == "ls"){
+                DIR *dir;
+                struct dirent *entry;
+            
+                if ((dir = opendir(client_directory.c_str())) != NULL) {
+                    while ((entry = readdir(dir)) != NULL) {
+                        string file_name(entry->d_name);
+                        // Skip hidden files if desired
+                        if (!file_name.empty() && file_name[0] == '.')
+                            continue;
+                        string entryLine = file_name + "\n";
+                        send(sock, entryLine.c_str(), entryLine.size(), 0);
+                    }
+                    closedir(dir);
+                } else {
+                    send(sock, "Error opening directory\n", 23, 0);
                 }
-                closedir(dir);
+                // Send end-of-transmission marker
+                string eofMarker = "EOF\n";
+                send(sock, eofMarker.c_str(), eofMarker.size(), 0);
             }
-            else{
-                ans = "Error opening directory\n";
-                send(sock, ans.c_str(), ans.size(), 0);
-                continue;
-            }
-
-            sort(response.begin(), response.end());
-            for (const auto &file : response){
-                if (file != "." && file != ".."){
-                    ans += file + "\n";
-                }
-            }
-            send(sock, ans.c_str(), ans.size(), 0);
-        }
 
         else if (command == "help"){
             string help_message = "Welcome to the FTP server!\n\n"
@@ -206,20 +201,41 @@ void *handle_client(void *client_socket){
             send(sock, help_message.c_str(), help_message.size(), 0);
         }
 
-        else if (command.substr(0, 2) == "cd"){
+        else if (command.substr(0, 2) == "cd") {
+            if (command.length() < 3) {
+                send(sock, "Error changing directory\n", 24, 0);
+                continue;
+            }
+            
             string path = command.substr(3);
-            string new_path = client_directory + "/" + path;
-
+            string new_path;
+            if (!path.empty() && path[0] == '/') {
+                new_path = path;
+            }
+            else if (!path.empty() && path[0] == '~') {
+                const char* home = getenv("HOME");
+                if (home == nullptr) {
+                    send(sock, "Error changing directory\n", 24, 0);
+                    continue;
+                }
+                new_path = string(home);
+                if (path.length() > 1) {
+                    if (path[1] != '/')
+                        new_path += "/";
+                    new_path += path.substr(1);
+                }
+            }
+            else {
+                new_path = client_directory + "/" + path;
+            }
             struct stat statbuf;
-            if (stat(new_path.c_str(), &statbuf) == 0 && S_ISDIR(statbuf.st_mode)){
+            if (stat(new_path.c_str(), &statbuf) == 0 && S_ISDIR(statbuf.st_mode)) {
                 client_directory = new_path;
                 send(sock, "Directory changed\n", 18, 0);
+            } else {
+                send(sock, "Error changing directory\n", 24, 0);
             }
-
-            else{
-                send(sock, "Error changing directory\n", 25, 0);
-            }
-        }
+     }
 
         else if (command.substr(0, 5) == "chmod"){
             string args = command.substr(6);
@@ -292,40 +308,44 @@ void *handle_client(void *client_socket){
             pthread_mutex_lock(&file_mutex);
             string filename = command.substr(4);
             string filepath = client_directory + "/" + filename;
-            
+        
             ifstream file(filepath, ios::binary);
             if (!file) {
-                send(sock, "ERROR", 5, 0);
+                send(sock, "NO", 2, 0);
                 pthread_mutex_unlock(&file_mutex);
                 continue;
             }
-            
+        
             send(sock, "OK", 2, 0);
             const uint32_t ERROR_SIGNAL = 0xFFFFFFFF;
             char buffer[BUFFER_SIZE];
-            cout<<"Sending "<<filename<<" ..."<<endl;
-
+        
+            cout << "Sending " << filename << " ...\n";
+        
             while (file.read(buffer, BUFFER_SIZE) || file.gcount() > 0) {
                 uint32_t chunk_size = file.gcount();
                 uint32_t net_chunk_size = htonl(chunk_size);
-                
+        
                 if (!send_all(sock, &net_chunk_size, sizeof(net_chunk_size)) || 
                     !send_all(sock, buffer, chunk_size)) {
                     uint32_t net_err = htonl(ERROR_SIGNAL);
                     send_all(sock, &net_err, sizeof(net_err));
+                    cout << "Error sending chunk. Aborted.\n";
                     break;
                 }
+        
+                // Optional debug
+                // cout << "Sent chunk of size: " << chunk_size << endl;
             }
-            
-            uint32_t zero = 0;
-            zero = htonl(zero);
+        
+            uint32_t zero = htonl(0);
             send_all(sock, &zero, sizeof(zero));
             file.close();
-            cout<<"File sent successfully\n"<<endl;
+            cout << "File sent successfully\n" << endl;
             pthread_mutex_unlock(&file_mutex);
-        }
+        }        
         
-        else if (command == "prompt"){
+        else if (command == "pwd"){
             char actualpath[PATH_MAX];
             if (realpath(client_directory.c_str(), actualpath) != NULL) {
                 string response = string(actualpath);
