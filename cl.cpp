@@ -16,6 +16,7 @@
 #define LGREEN "\033[1;32m"
 #define LBLUE "\033[1;34m"
 #define RESET "\033[0m"
+#define RED "\033[1;31m"
 
 using namespace std;
 void send_commandls(int sock, const std::string &command) {
@@ -31,12 +32,24 @@ void send_commandls(int sock, const std::string &command) {
         buffer[bytes_received] = '\0';
         completeResponse += buffer;
 
+        // Check for server shutdown message
+        if (completeResponse.find("SERVER_SHUTDOWN\n") != std::string::npos) {
+            cout << RED << "Server is shutting down. Disconnecting..." << RESET << endl;
+            close(sock);
+            exit(0);
+        }
+
         // Check if EOF marker is present
         if (completeResponse.find("EOF\n") != std::string::npos) {
             done = true;
             // Remove the EOF marker from the output
             completeResponse = completeResponse.substr(0, completeResponse.find("EOF\n"));
         }
+    }
+
+    if (bytes_received <= 0) {
+        cout << RED << "Connection to server lost" << RESET << endl;
+        exit(1);
     }
 
     // Split the response into lines and display
@@ -281,7 +294,20 @@ void send_command(int sock, string command){
     char buffer[BUFFER_SIZE];
     send(sock, command.c_str(), command.size(), 0);
     memset(buffer, 0, BUFFER_SIZE);
-    recv(sock, buffer, BUFFER_SIZE, 0);
+    int bytes_received = recv(sock, buffer, BUFFER_SIZE, 0);
+    
+    if (bytes_received <= 0) {
+        cout << RED << "Connection to server lost" << RESET << endl;
+        exit(1);
+    }
+    
+    string response(buffer);
+    if (response == "SERVER_SHUTDOWN\n") {
+        cout << RED << "Server is shutting down. Disconnecting..." << RESET << endl;
+        close(sock);
+        exit(0);
+    }
+    
     cout << buffer;
 }
 
@@ -312,10 +338,15 @@ void display_transfer_stats(uint64_t bytes, const chrono::duration<double>& elap
 }
 
 void handle_put(int sock, string filename) {
+    // Check if the source is a directory
+    if (is_dir(filename)) {
+        cout << RED << "Error: Cannot upload a directory" << RESET << endl;
+        return;
+    }
+
     ifstream file(filename, ios::binary);
     if (!file) {
-        cout << "File not found: " << filename << endl;
-        // send(sock, "ERROR", 5, 0);  // Notify server
+        cout << RED << "File not found: " << filename << RESET << endl;
         return;
     }
     
@@ -324,8 +355,15 @@ void handle_put(int sock, string filename) {
     
     char response[BUFFER_SIZE];
     recv(sock, response, BUFFER_SIZE, 0);
+    string response_str(response);
+    
+    if (response_str.find("ERROR:") != string::npos) {
+        cout << RED << response_str << RESET;
+        return;
+    }
+    
     if (strcmp(response, "ERROR") == 0) {
-        cout << "Server error" << endl;
+        cout << RED << "Server error" << RESET << endl;
         return;
     }
     
@@ -348,15 +386,15 @@ void handle_put(int sock, string filename) {
         uint32_t net_chunk_size = htonl(chunk_size);
         
         if (!send_all(sock, &net_chunk_size, sizeof(net_chunk_size))) {
-            cout << "Connection lost" << endl;
+            cout << RED << "Connection to server lost" << RESET << endl;
             p = 0;
             break;
         }
         
         if (!send_all(sock, buffer, chunk_size)) {
             uint32_t net_err = htonl(ERROR_SIGNAL);
-            send_all(sock, &net_err, sizeof(net_err));  // Send error signal
-            cout << "Transfer failed" << endl;
+            send_all(sock, &net_err, sizeof(net_err));
+            cout << RED << "Transfer failed" << RESET << endl;
             p = 0;
             break;
         }
@@ -381,21 +419,36 @@ void handle_put(int sock, string filename) {
     file.close();
 }
 
-// Modified handle_get function
 void handle_get(int sock, string filename) {
     string command = "get " + filename;
     send(sock, command.c_str(), command.size(), 0);
 
-    // Read exactly 2 bytes to check for "OK"
-    char ok[2];
-    if (!recv_all(sock, ok, 2) || strncmp(ok, "OK", 2) != 0) {
-        cout << "File not found on server or bad response." << endl;
+    // Read response
+    char response[BUFFER_SIZE];
+    recv(sock, response, BUFFER_SIZE, 0);
+    string response_str(response);
+    
+    // Check for directory error message
+    if (response_str.find("NO:") != string::npos) {
+        cout << RED << response_str << RESET;
+        return;
+    }
+
+    // Check for "NO" response
+    if (strncmp(response, "NO", 2) == 0) {
+        cout << RED << "File not found on server" << RESET << endl;
+        return;
+    }
+
+    // Check if local file exists and is a directory
+    if (is_dir(filename)) {
+        cout << RED << "Error: Cannot download to a directory" << RESET << endl;
         return;
     }
 
     ofstream file(filename, ios::binary);
     if (!file) {
-        cout << "Local file error" << endl;
+        cout << RED << "Local file error" << RESET << endl;
         return;
     }
 
@@ -412,7 +465,7 @@ void handle_get(int sock, string filename) {
     while (true) {
         uint32_t net_chunk_size;
         if (!recv_all(sock, &net_chunk_size, sizeof(net_chunk_size))) {
-            cout << "Connection lost\n";
+            cout << RED << "Connection to server lost" << RESET << endl;
             status = 0;
             break;
         }
@@ -420,7 +473,7 @@ void handle_get(int sock, string filename) {
         uint32_t chunk_size = ntohl(net_chunk_size);
 
         if (chunk_size == ERROR_SIGNAL) {
-            cout << "Server reported error\n";
+            cout << RED << "Server reported error" << RESET << endl;
             status = 0;
             break;
         }
@@ -428,20 +481,20 @@ void handle_get(int sock, string filename) {
         if (chunk_size == 0) break; // EOF
 
         if (chunk_size > BUFFER_SIZE) {
-            cout << "Received chunk size too big, possible corruption\n";
+            cout << RED << "Received chunk size too big, possible corruption" << RESET << endl;
             status = 0;
             break;
         }
 
         if (!recv_all(sock, buffer, chunk_size)) {
-            cout << "Incomplete chunk received\n";
+            cout << RED << "Incomplete chunk received" << RESET << endl;
             status = 0;
             break;
         }
 
         file.write(buffer, chunk_size);
         if (!file) {
-            cout << "File write error\n";
+            cout << RED << "File write error" << RESET << endl;
             status = 0;
             break;
         }
