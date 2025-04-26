@@ -13,6 +13,9 @@
 #include <arpa/inet.h>
 #include <limits.h>  // For PATH_MAX
 #include <stdlib.h>  // For realpath
+#include <sys/resource.h>  // For getrusage
+#include <ctime>          // For time functions
+#include <signal.h>  // For signal handling
 
 // #define port 8080
 #define MAX_CLIENTS 8
@@ -43,6 +46,115 @@ struct rwlock_t {
 
 rwlock_t rwlock;
 
+// Add these structures after the existing includes
+struct client_memory_stats {
+    size_t virtual_memory;    // Virtual memory usage in KB
+    size_t resident_memory;   // Resident memory usage in KB
+    time_t last_update;       // Last update timestamp
+    int client_id;           // Client identifier
+    size_t prev_virtual_memory;    // Previous virtual memory usage
+    size_t prev_resident_memory;   // Previous resident memory usage
+};
+
+// Global variables for memory tracking
+vector<client_memory_stats> client_stats;
+pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
+bool stats_changed = false;  // Flag to track if stats have changed
+
+// Add these global variables after other globals
+bool server_running = true;
+vector<int> client_sockets;
+pthread_mutex_t client_sockets_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Function to get memory usage for a process
+void get_process_memory_usage(size_t& virtual_memory, size_t& resident_memory) {
+    FILE* file = fopen("/proc/self/statm", "r");
+    if (file) {
+        unsigned long size, resident, share, text, lib, data, dt;
+        if (fscanf(file, "%lu %lu %lu %lu %lu %lu %lu", &size, &resident, &share, &text, &lib, &data, &dt) == 7) {
+            // Convert pages to KB (assuming 4KB pages)
+            virtual_memory = size * 4;
+            resident_memory = resident * 4;
+        }
+        fclose(file);
+    }
+}
+
+// Function to update client statistics
+void update_client_stats(int client_id) {
+    pthread_mutex_lock(&stats_mutex);
+    
+    size_t virtual_mem, resident_mem;
+    get_process_memory_usage(virtual_mem, resident_mem);
+    
+    // Find or create client stats entry
+    auto it = find_if(client_stats.begin(), client_stats.end(),
+                     [client_id](const client_memory_stats& s) { return s.client_id == client_id; });
+    
+    if (it != client_stats.end()) {
+        // Check if values have changed
+        if (it->virtual_memory != virtual_mem || it->resident_memory != resident_mem) {
+            it->prev_virtual_memory = it->virtual_memory;
+            it->prev_resident_memory = it->resident_memory;
+            it->virtual_memory = virtual_mem;
+            it->resident_memory = resident_mem;
+            it->last_update = time(nullptr);
+            stats_changed = true;
+        }
+    } else {
+        client_memory_stats new_stats = {
+            virtual_mem,
+            resident_mem,
+            time(nullptr),
+            client_id,
+            0,  // prev_virtual_memory
+            0   // prev_resident_memory
+        };
+        client_stats.push_back(new_stats);
+        stats_changed = true;
+    }
+    
+    pthread_mutex_unlock(&stats_mutex);
+}
+
+// Function to display memory statistics
+void display_memory_stats() {
+    pthread_mutex_lock(&stats_mutex);
+    
+    if (!stats_changed) {
+        pthread_mutex_unlock(&stats_mutex);
+        return;
+    }
+    
+    time_t current_time = time(nullptr);
+    cout << "\n" << CYAN << "=== Server Memory Usage Statistics ===" << RESET << "\n";
+    cout << "Time: " << ctime(&current_time);
+    cout << "Total Clients: " << client_count << "\n\n";
+    
+    cout << "Client ID | Virtual Memory (KB) | Resident Memory (KB) | Last Update\n";
+    cout << "----------|---------------------|----------------------|------------\n";
+    
+    for (const auto& stats : client_stats) {
+        cout << setw(9) << stats.client_id << " | "
+             << setw(19) << stats.virtual_memory << " | "
+             << setw(20) << stats.resident_memory << " | "
+             << ctime(&stats.last_update);
+    }
+    
+    cout << "\n" << CYAN << "=====================================" << RESET << "\n\n";
+    
+    stats_changed = false;  // Reset the change flag
+    pthread_mutex_unlock(&stats_mutex);
+}
+
+// Function to periodically display stats
+void* stats_display_thread(void* arg) {
+    while (true) {
+        sleep(30);  // Check every 30 seconds
+        display_memory_stats();
+    }
+    return nullptr;
+}
 
 // Initialize the reader-writer lock
 void rwlock_init(rwlock_t *rwlock) {
@@ -118,7 +230,7 @@ void read_unlock(rwlock_t *rwlock, const string &filename) {
     
     // If no more readers, signal any waiting writers
     if (rwlock->readers_count == 0 && rwlock->waiting_writers > 0) {
-        cout << CYAN << "] Signaling waiting writers" << RESET << endl;
+        cout << CYAN << "Signaling waiting writers" << RESET << endl;
         pthread_cond_signal(&rwlock->writers_cv);
     }
     
@@ -241,6 +353,39 @@ bool recv_all(int sock, void* buf, size_t len) {
     return true;
 }
 
+// Add this function before signal_handler
+void cleanup_and_exit() {
+    cout << "\n" << RED << "Server shutdown initiated..." << RESET << endl;
+    server_running = false;
+    
+    // Notify all clients
+    pthread_mutex_lock(&client_sockets_mutex);
+    for (int sock : client_sockets) {
+        string shutdown_msg = "SERVER_SHUTDOWN\n";
+        send(sock, shutdown_msg.c_str(), shutdown_msg.size(), 0);
+        close(sock);
+    }
+    client_sockets.clear();
+    pthread_mutex_unlock(&client_sockets_mutex);
+    
+    exit(0);
+}
+
+// Modify the signal handler
+void signal_handler(int signum) {
+    cout << "\n" << YELLOW << "Do you want to shut down the server? (y/n): " << RESET;
+    char response;
+    cin >> response;
+    
+    if (response == 'y' || response == 'Y') {
+        cleanup_and_exit();
+    } else {
+        cout << LGREEN << "Server shutdown cancelled. Continuing operation..." << RESET << endl;
+        // Reset the signal handler for next time
+        signal(SIGINT, signal_handler);
+    }
+}
+
 int main(int argc, char* argv[]){
     if (argc != 2) {
         cerr << "Usage: ./server <port>" <<endl;
@@ -253,8 +398,17 @@ int main(int argc, char* argv[]){
         return 1;
     }
 
+    // Set up signal handlers
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
     // Initialize the reader-writer lock
     rwlock_init(&rwlock);
+
+    // Start the stats display thread
+    pthread_t stats_thread;
+    pthread_create(&stats_thread, NULL, stats_display_thread, NULL);
+    pthread_detach(stats_thread);
 
     int server_fd, client_socket;
     struct sockaddr_in server_addr, client_addr;
@@ -293,7 +447,7 @@ int main(int argc, char* argv[]){
     }
     cout << "FTP Server started at " << myip<<":"<<port << " ...\n"<<endl;
 
-    while (true){
+    while (server_running){
         client_socket = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
         if (client_socket < 0){
             perror("Client accept failed");
@@ -314,14 +468,43 @@ void *handle_client(void *client_socket){
     int sock = *(int *)client_socket;
     char buffer[BUFFER_SIZE];
     string client_directory = ".";
+    int client_id = client_count;  // Use client_count as client ID
+    
+    // Add socket to tracking list
+    pthread_mutex_lock(&client_sockets_mutex);
+    client_sockets.push_back(sock);
+    pthread_mutex_unlock(&client_sockets_mutex);
+    
     cout<<LGREEN<<"Clients connected: "<<client_count<<RESET<<endl<<endl;
 
-    while (true){
+    while (server_running){
+        // Update client stats before processing each command
+        update_client_stats(client_id);
+        
         memset(buffer, 0, BUFFER_SIZE);
         if (recv(sock, buffer, BUFFER_SIZE, 0) <= 0){
             cout << LBLUE<<"Client disconnected.\n";
             client_count--;
             cout<<"Clients remaining: "<<client_count<<RESET<<endl<<endl;
+            
+            // Remove client stats on disconnect
+            pthread_mutex_lock(&stats_mutex);
+            client_stats.erase(
+                remove_if(client_stats.begin(), client_stats.end(),
+                         [client_id](const client_memory_stats& s) { return s.client_id == client_id; }),
+                client_stats.end()
+            );
+            stats_changed = true;
+            pthread_mutex_unlock(&stats_mutex);
+            
+            // Remove socket from tracking list
+            pthread_mutex_lock(&client_sockets_mutex);
+            client_sockets.erase(
+                remove(client_sockets.begin(), client_sockets.end(), sock),
+                client_sockets.end()
+            );
+            pthread_mutex_unlock(&client_sockets_mutex);
+            
             close(sock);
             pthread_exit(NULL);
         }
@@ -504,6 +687,12 @@ void *handle_client(void *client_socket){
             string filename = command.substr(4);
             string filepath = client_directory + "/" + filename;
             
+            // Check if the target is a directory
+            if (is_dir(filepath)) {
+                send(sock, "ERROR: Cannot upload a directory\n", 32, 0);
+                continue;
+            }
+            
             // Acquire exclusive (write) lock for the file
             write_lock(&rwlock, filepath);
             
@@ -557,6 +746,12 @@ void *handle_client(void *client_socket){
             string filename = command.substr(4);
             string filepath = client_directory + "/" + filename;
         
+            // Check if the target is a directory
+            if (is_dir(filepath)) {
+                send(sock, "NO: Cannot download a directory\n", 34, 0);
+                continue;
+            }
+            
             // Acquire shared (read) lock for the file
             read_lock(&rwlock, filepath);
             
@@ -620,4 +815,15 @@ void *handle_client(void *client_socket){
             send(sock, "Invalid command\n", 16, 0);
         }
     }
+    
+    // Clean up on server shutdown
+    pthread_mutex_lock(&client_sockets_mutex);
+    client_sockets.erase(
+        remove(client_sockets.begin(), client_sockets.end(), sock),
+        client_sockets.end()
+    );
+    pthread_mutex_unlock(&client_sockets_mutex);
+    
+    close(sock);
+    pthread_exit(NULL);
 }
