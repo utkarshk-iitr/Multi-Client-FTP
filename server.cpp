@@ -11,491 +11,296 @@
 #include <bits/stdc++.h>
 #include <ifaddrs.h>
 #include <arpa/inet.h>
-#include <fcntl.h>
-#include <map>
-#include <pwd.h>
-#include <grp.h>
-#include <time.h>
-#include <atomic>
-#include <chrono>
-#include <algorithm>
+#include <limits.h>  // For PATH_MAX
+#include <stdlib.h>  // For realpath
+#include <sys/resource.h>  // For getrusage
+#include <ctime>          // For time functions
+#include <signal.h>  // For signal handling
 
 // #define port 8080
 #define MAX_CLIENTS 8
 #define BUFFER_SIZE 4096
 #define LGREEN "\033[1;32m"
+#define DGREEN "\033[0;32m"
 #define LBLUE "\033[1;34m"
 #define RED "\033[1;31m"
 #define YELLOW "\033[1;33m"
+#define CYAN "\033[1;36m"
 #define RESET "\033[0m"
-#define LOCK_TIMEOUT_MS 5000     // 5 seconds lock timeout
-#define MAX_LOCK_RETRIES 10      // Maximum number of retries before giving up
-#define RETRY_DELAY_MS 100       // Initial retry delay (will increase with backoff)
-
 int client_count = 0;
-std::atomic<int> active_readers(0);
-std::atomic<int> active_writers(0);
 
 using namespace std;
 
-// Global mutex for file operations
-pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-// Enhanced file lock structure with timeout and activity tracking
-struct FileLock {
-    pthread_mutex_t mutex;           // For internal lock state protection
-    pthread_cond_t read_cv;          // Condition variable for readers
-    pthread_cond_t write_cv;         // Condition variable for writers
-    int readers;                     // Number of active readers
-    bool writer_active;              // Is there an active writer?
-    int waiting_readers;             // Number of waiting readers
-    int waiting_writers;             // Number of waiting writers
-    time_t last_accessed;            // Timestamp of last access
-    int lock_count;                  // Total number of times this file was locked
-    string current_locker;           // Information about current lock holder
-    
-    FileLock() : readers(0), writer_active(false), 
-                 waiting_readers(0), waiting_writers(0), 
-                 lock_count(0), current_locker("none") {
-        pthread_mutex_init(&mutex, NULL);
-        pthread_cond_init(&read_cv, NULL);
-        pthread_cond_init(&write_cv, NULL);
-        last_accessed = time(NULL);
-    }
-    
-    ~FileLock() {
-        pthread_mutex_destroy(&mutex);
-        pthread_cond_destroy(&read_cv);
-        pthread_cond_destroy(&write_cv);
-    }
+// File access synchronization - Reader-Writer lock implementation
+struct rwlock_t {
+    pthread_mutex_t mutex;          // Basic lock for the structure
+    pthread_cond_t readers_cv;      // For readers to wait
+    pthread_cond_t writers_cv;      // For writers to wait
+    int readers_count;              // Number of active readers
+    int writers_count;              // Number of active writers
+    int waiting_writers;            // Number of waiting writers
+    bool writer_active;             // Is there an active writer?
+    unordered_map<string, bool> locked_files; // Track which files are currently being written to
+    unordered_map<string, int> file_readers;  // Track number of readers per file
 };
 
-// Map to track file locks - maps filename to FileLock structure
-map<string, FileLock*> file_locks;
-pthread_mutex_t locks_mutex = PTHREAD_MUTEX_INITIALIZER;
+rwlock_t rwlock;
 
-// Stats for lock operations
-struct LockStats {
-    atomic<int> successful_read_locks;
-    atomic<int> successful_write_locks;
-    atomic<int> failed_read_locks;
-    atomic<int> failed_write_locks;
-    atomic<int> deadlock_preventions;
-    atomic<int> timeouts;
-    
-    LockStats() : successful_read_locks(0), successful_write_locks(0),
-                  failed_read_locks(0), failed_write_locks(0),
-                  deadlock_preventions(0), timeouts(0) {}
+// Add these structures after the existing includes
+struct client_memory_stats {
+    size_t virtual_memory;    // Virtual memory usage in KB
+    size_t resident_memory;   // Resident memory usage in KB
+    time_t last_update;       // Last update timestamp
+    int client_id;           // Client identifier
+    size_t prev_virtual_memory;    // Previous virtual memory usage
+    size_t prev_resident_memory;   // Previous resident memory usage
 };
 
-LockStats lock_stats;
+// Global variables for memory tracking
+vector<client_memory_stats> client_stats;
+pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
+bool stats_changed = false;  // Flag to track if stats have changed
 
-// Forward declaration
-void *handle_client(void *client_socket);
+// Add these global variables after other globals
+bool server_running = true;
+vector<int> client_sockets;
+pthread_mutex_t client_sockets_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Function to get file permissions string like "drwxr-xr-x"
-string get_permissions(mode_t mode) {
-    string perms;
-    perms += (S_ISDIR(mode)) ? 'd' : '-';
-    
-    // Owner permissions
-    perms += (mode & S_IRUSR) ? 'r' : '-';
-    perms += (mode & S_IWUSR) ? 'w' : '-';
-    perms += (mode & S_IXUSR) ? 'x' : '-';
-    
-    // Group permissions
-    perms += (mode & S_IRGRP) ? 'r' : '-';
-    perms += (mode & S_IWGRP) ? 'w' : '-';
-    perms += (mode & S_IXGRP) ? 'x' : '-';
-    
-    // Others permissions
-    perms += (mode & S_IROTH) ? 'r' : '-';
-    perms += (mode & S_IWOTH) ? 'w' : '-';
-    perms += (mode & S_IXOTH) ? 'x' : '-';
-    
-    return perms;
+// Function to get memory usage for a process
+void get_process_memory_usage(size_t& virtual_memory, size_t& resident_memory) {
+    FILE* file = fopen("/proc/self/statm", "r");
+    if (file) {
+        unsigned long size, resident, share, text, lib, data, dt;
+        if (fscanf(file, "%lu %lu %lu %lu %lu %lu %lu", &size, &resident, &share, &text, &lib, &data, &dt) == 7) {
+            // Convert pages to KB (assuming 4KB pages)
+            virtual_memory = size * 4;
+            resident_memory = resident * 4;
+        }
+        fclose(file);
+    }
 }
 
-// Function to format file size with appropriate units
-string format_size(off_t size) {
-    const char* units[] = {"B", "KB", "MB", "GB", "TB"};
-    int unit_index = 0;
-    double display_size = size;
+// Function to update client statistics
+void update_client_stats(int client_id) {
+    pthread_mutex_lock(&stats_mutex);
     
-    while (display_size >= 1024 && unit_index < 4) {
-        display_size /= 1024;
-        unit_index++;
-    }
+    size_t virtual_mem, resident_mem;
+    get_process_memory_usage(virtual_mem, resident_mem);
     
-    stringstream ss;
-    ss << fixed << setprecision(1);
-    if (unit_index == 0) {
-        ss << setprecision(0); // No decimal for bytes
-    }
-    ss << display_size << " " << units[unit_index];
-    return ss.str();
-}
-
-// Function to get a unique thread identifier string
-string get_thread_id() {
-    stringstream ss;
-    ss << pthread_self();
-    return ss.str();
-}
-
-// Enhanced function to acquire a read lock with timeout and priority handling
-bool acquire_read_lock(const string& filepath, int timeout_ms = LOCK_TIMEOUT_MS) {
-    pthread_mutex_lock(&locks_mutex);
+    // Find or create client stats entry
+    auto it = find_if(client_stats.begin(), client_stats.end(),
+                     [client_id](const client_memory_stats& s) { return s.client_id == client_id; });
     
-    // Create a new lock if it doesn't exist
-    if (file_locks.find(filepath) == file_locks.end()) {
-        file_locks[filepath] = new FileLock();
-    }
-    
-    FileLock* lock = file_locks[filepath];
-    pthread_mutex_unlock(&locks_mutex);
-    
-    bool acquired = false;
-    pthread_mutex_lock(&lock->mutex);
-    
-    // Update access time
-    lock->last_accessed = time(NULL);
-    
-    // Check if we can acquire immediately
-    if (!lock->writer_active && lock->waiting_writers == 0) {
-        // No active writer and no waiting writers - we can proceed
-        lock->readers++;
-        lock->lock_count++;
-        lock->current_locker = "reader:" + get_thread_id();
-        acquired = true;
-        lock_stats.successful_read_locks++;
-        active_readers++;
+    if (it != client_stats.end()) {
+        // Check if values have changed
+        if (it->virtual_memory != virtual_mem || it->resident_memory != resident_mem) {
+            it->prev_virtual_memory = it->virtual_memory;
+            it->prev_resident_memory = it->resident_memory;
+            it->virtual_memory = virtual_mem;
+            it->resident_memory = resident_mem;
+            it->last_update = time(nullptr);
+            stats_changed = true;
+        }
     } else {
-        // Wait with timeout if writers are active/waiting
-        lock->waiting_readers++;
-        
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += timeout_ms / 1000;
-        ts.tv_nsec += (timeout_ms % 1000) * 1000000;
-        if (ts.tv_nsec >= 1000000000) {
-            ts.tv_sec += 1;
-            ts.tv_nsec -= 1000000000;
-        }
-        
-        int wait_result = 0;
-        while (!acquired && wait_result != ETIMEDOUT) {
-            wait_result = pthread_cond_timedwait(&lock->read_cv, &lock->mutex, &ts);
-            
-            // If we're woken up, check if we can now acquire the lock
-            if (wait_result == 0 && !lock->writer_active) {
-                lock->readers++;
-                lock->lock_count++;
-                lock->current_locker = "reader:" + get_thread_id();
-                acquired = true;
-                lock_stats.successful_read_locks++;
-                active_readers++;
-            }
-        }
-        
-        lock->waiting_readers--;
-        
-        if (!acquired) {
-            // We failed to acquire the lock
-            lock_stats.failed_read_locks++;
-            if (wait_result == ETIMEDOUT) {
-                lock_stats.timeouts++;
-            }
-        }
+        client_memory_stats new_stats = {
+            virtual_mem,
+            resident_mem,
+            time(nullptr),
+            client_id,
+            0,  // prev_virtual_memory
+            0   // prev_resident_memory
+        };
+        client_stats.push_back(new_stats);
+        stats_changed = true;
     }
     
-    pthread_mutex_unlock(&lock->mutex);
-    return acquired;
+    pthread_mutex_unlock(&stats_mutex);
 }
 
-// Enhanced function to acquire a write lock with timeout
-bool acquire_write_lock(const string& filepath, int timeout_ms = LOCK_TIMEOUT_MS) {
-    pthread_mutex_lock(&locks_mutex);
+// Function to display memory statistics
+void display_memory_stats() {
+    pthread_mutex_lock(&stats_mutex);
     
-    // Create a new lock if it doesn't exist
-    if (file_locks.find(filepath) == file_locks.end()) {
-        file_locks[filepath] = new FileLock();
+    if (!stats_changed) {
+        pthread_mutex_unlock(&stats_mutex);
+        return;
     }
     
-    FileLock* lock = file_locks[filepath];
-    pthread_mutex_unlock(&locks_mutex);
+    time_t current_time = time(nullptr);
+    cout << "\n" << CYAN << "=== Server Memory Usage Statistics ===" << RESET << "\n";
+    cout << "Time: " << ctime(&current_time);
+    cout << "Total Clients: " << client_count << "\n\n";
     
-    bool acquired = false;
-    pthread_mutex_lock(&lock->mutex);
+    cout << "Client ID | Virtual Memory (KB) | Resident Memory (KB) | Last Update\n";
+    cout << "----------|---------------------|----------------------|------------\n";
     
-    // Update access time
-    lock->last_accessed = time(NULL);
-    
-    // Check if we can acquire immediately
-    if (!lock->writer_active && lock->readers == 0) {
-        // No active writers or readers - we can proceed
-        lock->writer_active = true;
-        lock->lock_count++;
-        lock->current_locker = "writer:" + get_thread_id();
-        acquired = true;
-        lock_stats.successful_write_locks++;
-        active_writers++;
-    } else {
-        // Wait with timeout if other threads are active
-        lock->waiting_writers++;
-        
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += timeout_ms / 1000;
-        ts.tv_nsec += (timeout_ms % 1000) * 1000000;
-        if (ts.tv_nsec >= 1000000000) {
-            ts.tv_sec += 1;
-            ts.tv_nsec -= 1000000000;
-        }
-        
-        int wait_result = 0;
-        while (!acquired && wait_result != ETIMEDOUT) {
-            wait_result = pthread_cond_timedwait(&lock->write_cv, &lock->mutex, &ts);
-            
-            // If we're woken up, check if we can now acquire the lock
-            if (wait_result == 0 && !lock->writer_active && lock->readers == 0) {
-                lock->writer_active = true;
-                lock->lock_count++;
-                lock->current_locker = "writer:" + get_thread_id();
-                acquired = true;
-                lock_stats.successful_write_locks++;
-                active_writers++;
-            }
-        }
-        
-        lock->waiting_writers--;
-        
-        if (!acquired) {
-            // We failed to acquire the lock
-            lock_stats.failed_write_locks++;
-            if (wait_result == ETIMEDOUT) {
-                lock_stats.timeouts++;
-            }
-        }
+    for (const auto& stats : client_stats) {
+        cout << setw(9) << stats.client_id << " | "
+             << setw(19) << stats.virtual_memory << " | "
+             << setw(20) << stats.resident_memory << " | "
+             << ctime(&stats.last_update);
     }
     
-    pthread_mutex_unlock(&lock->mutex);
-    return acquired;
+    cout << "\n" << CYAN << "=====================================" << RESET << "\n\n";
+    
+    stats_changed = false;  // Reset the change flag
+    pthread_mutex_unlock(&stats_mutex);
 }
 
-// Enhanced function to release a read lock
-void release_read_lock(const string& filepath) {
-    pthread_mutex_lock(&locks_mutex);
-    
-    if (file_locks.find(filepath) != file_locks.end()) {
-        FileLock* lock = file_locks[filepath];
-        pthread_mutex_lock(&lock->mutex);
-        
-        // Update access time
-        lock->last_accessed = time(NULL);
-        
-        // Release the read lock
-        if (lock->readers > 0) {
-            lock->readers--;
-            active_readers--;
-            
-            // If this was the last reader and writers are waiting, signal one writer
-            if (lock->readers == 0 && lock->waiting_writers > 0) {
-                pthread_cond_signal(&lock->write_cv);
-            }
-            
-            // Clean up if no more activity
-            if (lock->readers == 0 && !lock->writer_active && 
-                lock->waiting_readers == 0 && lock->waiting_writers == 0) {
-                pthread_mutex_unlock(&lock->mutex);
-                pthread_mutex_destroy(&lock->mutex);
-                pthread_cond_destroy(&lock->read_cv);
-                pthread_cond_destroy(&lock->write_cv);
-                delete lock;
-                file_locks.erase(filepath);
-                pthread_mutex_unlock(&locks_mutex);
-                return;
-            }
-        }
-        
-        pthread_mutex_unlock(&lock->mutex);
-    }
-    
-    pthread_mutex_unlock(&locks_mutex);
-}
-
-// Enhanced function to release a write lock
-void release_write_lock(const string& filepath) {
-    pthread_mutex_lock(&locks_mutex);
-    
-    if (file_locks.find(filepath) != file_locks.end()) {
-        FileLock* lock = file_locks[filepath];
-        pthread_mutex_lock(&lock->mutex);
-        
-        // Update access time
-        lock->last_accessed = time(NULL);
-        
-        // Release the write lock
-        if (lock->writer_active) {
-            lock->writer_active = false;
-            active_writers--;
-            
-            // Signal based on our policy - prefer writers unless too many readers waiting
-            if (lock->waiting_writers > 0 && lock->waiting_readers < 10) {
-                // Signal a waiting writer
-                pthread_cond_signal(&lock->write_cv);
-            } else if (lock->waiting_readers > 0) {
-                // Signal all waiting readers
-                pthread_cond_broadcast(&lock->read_cv);
-            }
-            
-            // Clean up if no more activity
-            if (lock->readers == 0 && !lock->writer_active && 
-                lock->waiting_readers == 0 && lock->waiting_writers == 0) {
-                pthread_mutex_unlock(&lock->mutex);
-                pthread_mutex_destroy(&lock->mutex);
-                pthread_cond_destroy(&lock->read_cv);
-                pthread_cond_destroy(&lock->write_cv);
-                delete lock;
-                file_locks.erase(filepath);
-                pthread_mutex_unlock(&locks_mutex);
-                return;
-            }
-        }
-        
-        pthread_mutex_unlock(&lock->mutex);
-    }
-    
-    pthread_mutex_unlock(&locks_mutex);
-}
-
-// Function to acquire a read lock with exponential backoff and deadlock prevention
-bool acquire_read_lock_with_retry(const string& filepath) {
-    int retries = 0;
-    int delay_ms = RETRY_DELAY_MS;
-    
-    while (retries < MAX_LOCK_RETRIES) {
-        if (acquire_read_lock(filepath)) {
-            return true;
-        }
-        
-        // Detect potential deadlock conditions
-        if (active_writers > 0 && active_readers > 3 * MAX_CLIENTS) {
-            lock_stats.deadlock_preventions++;
-            cout << YELLOW << "Deadlock prevention: too many readers waiting for writers" << RESET << endl;
-            usleep(delay_ms * 5 * 1000); // Wait 5x longer in deadlock situations
-        }
-        
-        // Exponential backoff with jitter
-        usleep(delay_ms * 1000);
-        delay_ms = min(delay_ms * 2, 1000); // Cap at 1 second
-        retries++;
-    }
-    
-    return false;
-}
-
-// Function to acquire a write lock with exponential backoff and deadlock prevention
-bool acquire_write_lock_with_retry(const string& filepath) {
-    int retries = 0;
-    int delay_ms = RETRY_DELAY_MS;
-    
-    while (retries < MAX_LOCK_RETRIES) {
-        if (acquire_write_lock(filepath)) {
-            return true;
-        }
-        
-        // Detect potential deadlock conditions
-        if (active_readers > 0 && active_writers > MAX_CLIENTS / 2) {
-            lock_stats.deadlock_preventions++;
-            cout << YELLOW << "Deadlock prevention: too many writers waiting for readers" << RESET << endl;
-            usleep(delay_ms * 5 * 1000); // Wait 5x longer in deadlock situations
-        }
-        
-        // Exponential backoff with jitter
-        int jitter = rand() % 50; // Add up to 50ms of randomness
-        usleep((delay_ms + jitter) * 1000);
-        delay_ms = min(delay_ms * 2, 1000); // Cap at 1 second
-        retries++;
-    }
-    
-    return false;
-}
-
-// Function to print lock statistics
-void print_lock_stats() {
-    cout << LBLUE << "\n--- Lock Statistics ---" << RESET << endl;
-    cout << "Active readers: " << active_readers << endl;
-    cout << "Active writers: " << active_writers << endl;
-    cout << "Successful read locks: " << lock_stats.successful_read_locks << endl;
-    cout << "Successful write locks: " << lock_stats.successful_write_locks << endl;
-    cout << "Failed read locks: " << lock_stats.failed_read_locks << endl;
-    cout << "Failed write locks: " << lock_stats.failed_write_locks << endl;
-    cout << "Deadlock preventions: " << lock_stats.deadlock_preventions << endl;
-    cout << "Timeouts: " << lock_stats.timeouts << endl;
-    
-    // List of active locks
-    pthread_mutex_lock(&locks_mutex);
-    cout << "\nActive locks: " << file_locks.size() << endl;
-    for (const auto& pair : file_locks) {
-        pthread_mutex_lock(&pair.second->mutex);
-        cout << "  " << pair.first << ": ";
-        cout << "R=" << pair.second->readers << ", ";
-        cout << "W=" << (pair.second->writer_active ? "1" : "0") << ", ";
-        cout << "WR=" << pair.second->waiting_readers << ", ";
-        cout << "WW=" << pair.second->waiting_writers << ", ";
-        cout << "Count=" << pair.second->lock_count << ", ";
-        cout << "By=" << pair.second->current_locker << endl;
-        pthread_mutex_unlock(&pair.second->mutex);
-    }
-    pthread_mutex_unlock(&locks_mutex);
-    cout << LBLUE << "----------------------" << RESET << endl;
-}
-
-// Thread function to periodically clean up abandoned locks
-void* monitor_locks(void* arg) {
+// Function to periodically display stats
+void* stats_display_thread(void* arg) {
     while (true) {
-        sleep(60); // Check every minute
+        sleep(30);  // Check every 30 seconds
+        display_memory_stats();
+    }
+    return nullptr;
+}
+
+// Initialize the reader-writer lock
+void rwlock_init(rwlock_t *rwlock) {
+    pthread_mutex_init(&rwlock->mutex, NULL);
+    pthread_cond_init(&rwlock->readers_cv, NULL);
+    pthread_cond_init(&rwlock->writers_cv, NULL);
+    rwlock->readers_count = 0;
+    rwlock->writers_count = 0;
+    rwlock->waiting_writers = 0;
+    rwlock->writer_active = false;
+}
+
+// Add this function before main()
+string clean_path(const string& path) {
+    char resolved_path[PATH_MAX];
+    if (realpath(path.c_str(), resolved_path) != NULL) {
+        return string(resolved_path);
+    }
+    return path;  // Return original path if realpath fails
+}
+
+// Acquire a read lock on a specific file
+void read_lock(rwlock_t *rwlock, const string &filename) {
+    pthread_mutex_lock(&rwlock->mutex);
+    
+    string clean_filename = clean_path(filename);
+    
+    // Display waiting status if needed
+    if (rwlock->locked_files[clean_filename] || rwlock->waiting_writers > 0) {
+        cout << YELLOW << "Waiting for READ lock on: " << clean_filename;
         
-        time_t now = time(NULL);
-        vector<string> to_remove;
+        if (rwlock->locked_files[clean_filename])
+            cout << " (file is being written)";
+        if (rwlock->waiting_writers > 0)
+            cout << " (writers are waiting: " << rwlock->waiting_writers << ")";
         
-        pthread_mutex_lock(&locks_mutex);
-        for (const auto& pair : file_locks) {
-            pthread_mutex_lock(&pair.second->mutex);
-            
-            // If lock is inactive (no readers/writers/waiters) and hasn't been accessed in 10 minutes
-            if (pair.second->readers == 0 && !pair.second->writer_active &&
-                pair.second->waiting_readers == 0 && pair.second->waiting_writers == 0 &&
-                difftime(now, pair.second->last_accessed) > 600) {
-                
-                to_remove.push_back(pair.first);
-            }
-            
-            pthread_mutex_unlock(&pair.second->mutex);
-        }
-        
-        // Remove abandoned locks
-        for (const auto& path : to_remove) {
-            FileLock* lock = file_locks[path];
-            pthread_mutex_destroy(&lock->mutex);
-            pthread_cond_destroy(&lock->read_cv);
-            pthread_cond_destroy(&lock->write_cv);
-            delete lock;
-            file_locks.erase(path);
-            cout << YELLOW << "Cleaned up abandoned lock: " << path << RESET << endl;
-        }
-        
-        pthread_mutex_unlock(&locks_mutex);
-        
-        // Print lock statistics periodically
-        if (!to_remove.empty() || file_locks.size() > 0) {
-            print_lock_stats();
-        }
+        cout << RESET << endl;
     }
     
-    return NULL;
+    // Wait if there's an active writer or waiting writers for this file
+    while (rwlock->locked_files[clean_filename] || rwlock->waiting_writers > 0) {
+        pthread_cond_wait(&rwlock->readers_cv, &rwlock->mutex);
+    }
+    
+    // Increment readers count
+    rwlock->readers_count++;
+    rwlock->file_readers[clean_filename]++;
+    
+    cout << CYAN <<"Acquired READ lock on: " << clean_filename 
+         << " (readers: " << rwlock->file_readers[clean_filename] << ")" << RESET << endl;
+    
+    pthread_mutex_unlock(&rwlock->mutex);
 }
+
+// Release a read lock
+void read_unlock(rwlock_t *rwlock, const string &filename) {
+    pthread_mutex_lock(&rwlock->mutex);
+    
+    string clean_filename = clean_path(filename);
+    
+    // Decrement readers count
+    rwlock->readers_count--;
+    rwlock->file_readers[clean_filename]--;
+    
+    cout << CYAN << "Released READ lock on: " << clean_filename;
+    
+    if (rwlock->file_readers[clean_filename] > 0) {
+        cout << " (readers remaining: " << rwlock->file_readers[clean_filename] << ")";
+    } else {
+        cout << " (no readers left)";
+    }
+    cout << RESET << endl;
+    
+    // If no more readers, signal any waiting writers
+    if (rwlock->readers_count == 0 && rwlock->waiting_writers > 0) {
+        cout << CYAN << "Signaling waiting writers" << RESET << endl;
+        pthread_cond_signal(&rwlock->writers_cv);
+    }
+    
+    pthread_mutex_unlock(&rwlock->mutex);
+}
+
+// Acquire a write lock on a specific file
+void write_lock(rwlock_t *rwlock, const string &filename) {
+    pthread_mutex_lock(&rwlock->mutex);
+    
+    string clean_filename = clean_path(filename);
+    
+    // Increment waiting writers
+    rwlock->waiting_writers++;
+    
+    // Display waiting status if needed
+    if (rwlock->readers_count > 0 || rwlock->locked_files[clean_filename]) {
+        cout << YELLOW << "Waiting for WRITE lock on: " << clean_filename;
+        
+        if (rwlock->readers_count > 0)
+            cout << " (active readers: " << rwlock->file_readers[clean_filename] << ")";
+        if (rwlock->locked_files[clean_filename])
+            cout << " (file is locked for writing)";
+        
+        cout << RESET << endl;
+    }
+    
+    // Wait if there are active readers or another writer on this file
+    while (rwlock->readers_count > 0 || rwlock->locked_files[clean_filename]) {
+        pthread_cond_wait(&rwlock->writers_cv, &rwlock->mutex);
+    }
+    
+    // Decrement waiting writers and mark as active writer
+    rwlock->waiting_writers--;
+    rwlock->writers_count++;
+    rwlock->locked_files[clean_filename] = true;
+    
+    cout << DGREEN << "Acquired WRITE lock on: " << clean_filename 
+         << " (waiting writers: " << rwlock->waiting_writers << ")" << RESET << endl;
+    
+    pthread_mutex_unlock(&rwlock->mutex);
+}
+
+// Release a write lock
+void write_unlock(rwlock_t *rwlock, const string &filename) {
+    pthread_mutex_lock(&rwlock->mutex);
+    
+    string clean_filename = clean_path(filename);
+    
+    // Decrement writers count and mark file as unlocked
+    rwlock->writers_count--;
+    rwlock->locked_files[clean_filename] = false;
+    
+    cout << DGREEN << "Released WRITE lock on: " << clean_filename << RESET << endl;
+    
+    // Wake up all waiting threads
+    // Readers if no waiting writers, otherwise wake a writer
+    if (rwlock->waiting_writers > 0) {
+        cout << DGREEN << "Signaling next writer" << RESET << endl;
+        pthread_cond_signal(&rwlock->writers_cv);
+    } else {
+        cout << DGREEN << "Broadcasting to all readers" << RESET << endl;
+        pthread_cond_broadcast(&rwlock->readers_cv);
+    }
+    
+    pthread_mutex_unlock(&rwlock->mutex);
+}
+
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+void *handle_client(void *client_socket);
 
 bool is_dir(const string path) {
     struct stat path_stat;
@@ -503,12 +308,6 @@ bool is_dir(const string path) {
         return false;
     }
     return S_ISDIR(path_stat.st_mode);
-}
-
-// Check if file/directory exists
-bool file_exists(const string& path) {
-    struct stat buffer;
-    return (stat(path.c_str(), &buffer) == 0);
 }
 
 string getip(){
@@ -554,19 +353,40 @@ bool recv_all(int sock, void* buf, size_t len) {
     return true;
 }
 
-// Parse command and arguments
-void parse_command(const string& input, string& command, string& args) {
-    size_t space_pos = input.find(' ');
-    if (space_pos != string::npos) {
-        command = input.substr(0, space_pos);
-        args = input.substr(space_pos + 1);
+// Add this function before signal_handler
+void cleanup_and_exit() {
+    cout << "\n" << RED << "Server shutdown initiated..." << RESET << endl;
+    server_running = false;
+    
+    // Notify all clients
+    pthread_mutex_lock(&client_sockets_mutex);
+    for (int sock : client_sockets) {
+        string shutdown_msg = "SERVER_SHUTDOWN\n";
+        send(sock, shutdown_msg.c_str(), shutdown_msg.size(), 0);
+        close(sock);
+    }
+    client_sockets.clear();
+    pthread_mutex_unlock(&client_sockets_mutex);
+    
+    exit(0);
+}
+
+// Modify the signal handler
+void signal_handler(int signum) {
+    cout << "\n" << YELLOW << "Do you want to shut down the server? (y/n): " << RESET;
+    char response;
+    cin >> response;
+    
+    if (response == 'y' || response == 'Y') {
+        cleanup_and_exit();
     } else {
-        command = input;
-        args = "";
+        cout << LGREEN << "Server shutdown cancelled. Continuing operation..." << RESET << endl;
+        // Reset the signal handler for next time
+        signal(SIGINT, signal_handler);
     }
 }
 
-int main(int argc, char* argv[]) {
+int main(int argc, char* argv[]){
     if (argc != 2) {
         cerr << "Usage: ./server <port>" <<endl;
         return 1;
@@ -578,18 +398,30 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Set up signal handlers
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    // Initialize the reader-writer lock
+    rwlock_init(&rwlock);
+
+    // Start the stats display thread
+    pthread_t stats_thread;
+    pthread_create(&stats_thread, NULL, stats_display_thread, NULL);
+    pthread_detach(stats_thread);
+
     int server_fd, client_socket;
     struct sockaddr_in server_addr, client_addr;
     socklen_t addr_len = sizeof(client_addr);
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1) {
+    if (server_fd == -1){
         perror("Socket creation failed");
         exit(EXIT_FAILURE);
     }
 
     int opt = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0){
         perror("Reuse failed");
         exit(EXIT_FAILURE);
     }
@@ -598,49 +430,33 @@ int main(int argc, char* argv[]) {
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(port);
 
-    if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+    if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0){
         perror("Bind failed");
         exit(EXIT_FAILURE);
     }
 
-    if (listen(server_fd, MAX_CLIENTS) < 0) {
+    if (listen(server_fd, MAX_CLIENTS) < 0){
         perror("Listen failed");
         exit(EXIT_FAILURE);
     }
 
-    // Initialize random seed for jitter in backoff algorithm
-    srand(time(NULL));
-    
-    // Start lock monitor thread
-    pthread_t monitor_thread;
-    if (pthread_create(&monitor_thread, NULL, monitor_locks, NULL) != 0) {
-        cerr << "Failed to create lock monitor thread" << endl;
-    } else {
-        pthread_detach(monitor_thread);
-    }
-
     string myip = getip();
-    if (myip == "-1") {
-        cout << "Error in getting IP" << endl;
+    if(myip=="-1"){
+        cout<<"Error in getting IP"<<endl;
         return 0;
     }
-    cout << "FTP Server started at " << myip << ":" << port << " ...\n" << endl;
+    cout << "FTP Server started at " << myip<<":"<<port << " ...\n"<<endl;
 
-    while (true) {
+    while (server_running){
         client_socket = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
-        if (client_socket < 0) {
+        if (client_socket < 0){
             perror("Client accept failed");
             continue;
         }
 
         pthread_t thread_id;
         client_count++;
-        
-        // Create a copy of the socket descriptor for the thread
-        int* client_sock = new int;
-        *client_sock = client_socket;
-        
-        pthread_create(&thread_id, NULL, handle_client, (void *)client_sock);
+        pthread_create(&thread_id, NULL, handle_client, (void *)&client_socket);
         pthread_detach(thread_id);
     }
 
@@ -648,180 +464,173 @@ int main(int argc, char* argv[]) {
     return 0;
 }
 
-// Handle ls command with options
-void handle_ls(int sock, const string& args, const string& client_directory) {
-    bool show_hidden = false;
-    bool long_format = false;
-    string target_dir = client_directory;
-    
-    // Parse arguments
-    stringstream ss(args);
-    string token;
-    vector<string> arg_parts;
-    
-    while (ss >> token) {
-        arg_parts.push_back(token);
-    }
-    
-    // Process options and target directory
-    for (const auto& arg : arg_parts) {
-        if (arg[0] == '-') {
-            // Process flags
-            for (size_t i = 1; i < arg.size(); i++) {
-                if (arg[i] == 'a') show_hidden = true;
-                else if (arg[i] == 'l') long_format = true;
-            }
-        } else {
-            // Treat as target directory
-            string path = (arg[0] == '/') ? arg : client_directory + "/" + arg;
-            if (is_dir(path)) {
-                target_dir = path;
-            } else {
-                string error_msg = "ls: cannot access '" + arg + "': No such file or directory\n";
-                send(sock, error_msg.c_str(), error_msg.size(), 0);
-                string eofMarker = "EOF\n";
-                send(sock, eofMarker.c_str(), eofMarker.size(), 0);
-                return;
-            }
-        }
-    }
-    
-    // Acquire a read lock on the directory for consistent listing
-    if (!acquire_read_lock_with_retry(target_dir)) {
-        string error_msg = "ls: Unable to acquire lock on directory. Server busy, try again later.\n";
-        send(sock, error_msg.c_str(), error_msg.size(), 0);
-        string eofMarker = "EOF\n";
-        send(sock, eofMarker.c_str(), eofMarker.size(), 0);
-        return;
-    }
-    
-    DIR *dir;
-    struct dirent *entry;
-    vector<string> files;
-    
-    if ((dir = opendir(target_dir.c_str())) != NULL) {
-        while ((entry = readdir(dir)) != NULL) {
-            string file_name(entry->d_name);
-            
-            // Skip hidden files unless -a is specified
-            if (!show_hidden && !file_name.empty() && file_name[0] == '.')
-                continue;
-                
-            files.push_back(file_name);
-        }
-        closedir(dir);
-        
-        // Sort files
-        sort(files.begin(), files.end());
-        
-        // Display files
-        for (const auto& file_name : files) {
-            if (long_format) {
-                string full_path = target_dir + "/" + file_name;
-                struct stat file_stat;
-                
-                if (stat(full_path.c_str(), &file_stat) == 0) {
-                    string perms = get_permissions(file_stat.st_mode);
-                    
-                    // Get user and group names
-                    struct passwd *pw = getpwuid(file_stat.st_uid);
-                    struct group *gr = getgrgid(file_stat.st_gid);
-                    string username = pw ? pw->pw_name : to_string(file_stat.st_uid);
-                    string groupname = gr ? gr->gr_name : to_string(file_stat.st_gid);
-                    
-                    // Format time
-                    char time_str[30];
-                    strftime(time_str, sizeof(time_str), "%b %d %H:%M", localtime(&file_stat.st_mtime));
-                    
-                    // Format output line
-                    stringstream line;
-                    line << perms << " ";
-                    line << setw(3) << right << file_stat.st_nlink << " ";
-                    line << setw(8) << left << username << " ";
-                    line << setw(8) << left << groupname << " ";
-                    line << setw(8) << right << format_size(file_stat.st_size) << " ";
-                    line << time_str << " ";
-                    line << file_name;
-                    
-                    string entry_line = line.str() + "\n";
-                    send(sock, entry_line.c_str(), entry_line.size(), 0);
-                }
-            } else {
-                string entry_line = file_name + "\n";
-                send(sock, entry_line.c_str(), entry_line.size(), 0);
-            }
-        }
-    } else {
-        string error_msg = "Error opening directory\n";
-        send(sock, error_msg.c_str(), error_msg.size(), 0);
-    }
-    
-    // Release the read lock
-    release_read_lock(target_dir);
-    
-    // Send end-of-transmission marker
-    string eofMarker = "EOF\n";
-    send(sock, eofMarker.c_str(), eofMarker.size(), 0);
-}
-
-void *handle_client(void *client_socket) {
+void *handle_client(void *client_socket){
     int sock = *(int *)client_socket;
-    delete (int*)client_socket;  // Free the allocated memory
-    
     char buffer[BUFFER_SIZE];
     string client_directory = ".";
-    cout << LGREEN << "Clients connected: " << client_count << RESET << endl << endl;
+    int client_id = client_count;  // Use client_count as client ID
+    
+    // Add socket to tracking list
+    pthread_mutex_lock(&client_sockets_mutex);
+    client_sockets.push_back(sock);
+    pthread_mutex_unlock(&client_sockets_mutex);
+    
+    cout<<LGREEN<<"Clients connected: "<<client_count<<RESET<<endl<<endl;
 
-    while (true) {
+    while (server_running){
+        // Update client stats before processing each command
+        update_client_stats(client_id);
+        
         memset(buffer, 0, BUFFER_SIZE);
-        if (recv(sock, buffer, BUFFER_SIZE, 0) <= 0) {
-            cout << LBLUE << "Client disconnected.\n";
+        if (recv(sock, buffer, BUFFER_SIZE, 0) <= 0){
+            cout << LBLUE<<"Client disconnected.\n";
             client_count--;
-            cout << "Clients remaining: " << client_count << RESET << endl << endl;
+            cout<<"Clients remaining: "<<client_count<<RESET<<endl<<endl;
+            
+            // Remove client stats on disconnect
+            pthread_mutex_lock(&stats_mutex);
+            client_stats.erase(
+                remove_if(client_stats.begin(), client_stats.end(),
+                         [client_id](const client_memory_stats& s) { return s.client_id == client_id; }),
+                client_stats.end()
+            );
+            stats_changed = true;
+            pthread_mutex_unlock(&stats_mutex);
+            
+            // Remove socket from tracking list
+            pthread_mutex_lock(&client_sockets_mutex);
+            client_sockets.erase(
+                remove(client_sockets.begin(), client_sockets.end(), sock),
+                client_sockets.end()
+            );
+            pthread_mutex_unlock(&client_sockets_mutex);
+            
             close(sock);
             pthread_exit(NULL);
         }
 
-        string command_input(buffer);
-        command_input = command_input.substr(0, command_input.find("\n"));
-        
-        // Parse command and arguments
-        string command, args;
-        parse_command(command_input, command, args);
+        string command(buffer);
+        command = command.substr(0, command.find("\n"));
 
-        if (command == "ls") {
-            handle_ls(sock, args, client_directory);
-        }
+            if (command == "ls"){
+                DIR *dir;
+                struct dirent *entry;
+                struct stat file_stat;
+                vector<pair<string, bool>> entries;  // pair of entry string and is_directory flag
+                size_t max_perms = 0, max_links = 0, max_uid = 0, max_gid = 0, max_size = 0, max_time = 0, max_name = 0;
+            
+                if ((dir = opendir(client_directory.c_str())) != NULL) {
+                    // First pass: collect all entries and find max lengths
+                    while ((entry = readdir(dir)) != NULL) {
+                        string file_name(entry->d_name);
+                        string full_path = client_directory + "/" + file_name;
+                        
+                        if (stat(full_path.c_str(), &file_stat) == 0) {
+                            // Format permissions
+                            string permissions = "";
+                            permissions += (S_ISDIR(file_stat.st_mode)) ? "d" : "-";
+                            permissions += (file_stat.st_mode & S_IRUSR) ? "r" : "-";
+                            permissions += (file_stat.st_mode & S_IWUSR) ? "w" : "-";
+                            permissions += (file_stat.st_mode & S_IXUSR) ? "x" : "-";
+                            permissions += (file_stat.st_mode & S_IRGRP) ? "r" : "-";
+                            permissions += (file_stat.st_mode & S_IWGRP) ? "w" : "-";
+                            permissions += (file_stat.st_mode & S_IXGRP) ? "x" : "-";
+                            permissions += (file_stat.st_mode & S_IROTH) ? "r" : "-";
+                            permissions += (file_stat.st_mode & S_IWOTH) ? "w" : "-";
+                            permissions += (file_stat.st_mode & S_IXOTH) ? "x" : "-";
 
-        else if (command == "help") {
+                            // Format size
+                            string size = to_string(file_stat.st_size);
+
+                            // Format time
+                            char time_str[20];
+                            strftime(time_str, sizeof(time_str), "%b %d %H:%M", localtime(&file_stat.st_mtime));
+
+                            // Update max lengths
+                            max_perms = max(max_perms, permissions.length());
+                            max_links = max(max_links, to_string(file_stat.st_nlink).length());
+                            max_uid = max(max_uid, to_string(file_stat.st_uid).length());
+                            max_gid = max(max_gid, to_string(file_stat.st_gid).length());
+                            max_size = max(max_size, size.length());
+                            max_time = max(max_time, strlen(time_str));
+                            max_name = max(max_name, file_name.length());
+
+                            // Create the detailed listing
+                            string entryLine = permissions + " " + 
+                                             to_string(file_stat.st_nlink) + " " +
+                                             to_string(file_stat.st_uid) + " " +
+                                             to_string(file_stat.st_gid) + " " +
+                                             size + " " +
+                                             time_str + " " +
+                                             file_name;
+                            
+                            entries.push_back({entryLine, S_ISDIR(file_stat.st_mode)});
+                        }
+                    }
+                    closedir(dir);
+
+                    // Sort entries: directories first, then alphabetically
+                    sort(entries.begin(), entries.end(), [](const pair<string, bool>& a, const pair<string, bool>& b) {
+                        if (a.second != b.second) {
+                            return a.second > b.second;  // Directories first
+                        }
+                        // Extract filenames for comparison
+                        string a_name = a.first.substr(a.first.rfind(" ") + 1);
+                        string b_name = b.first.substr(b.first.rfind(" ") + 1);
+                        return a_name < b_name;
+                    });
+
+                    // Second pass: send formatted entries
+                    for (const auto& entry : entries) {
+                        stringstream ss(entry.first);
+                        string perms, links, uid, gid, size, time, name;
+                        ss >> perms >> links >> uid >> gid >> size >> time;
+                        getline(ss, name); // Get the rest as filename (may contain spaces)
+                        name = name.substr(1); // Remove leading space
+
+                        // Format with padding
+                        string formatted = perms + string(max_perms - perms.length() + 2, ' ') +
+                                         links + string(max_links - links.length() + 2, ' ') +
+                                         uid + string(max_uid - uid.length() + 2, ' ') +
+                                         gid + string(max_gid - gid.length() + 2, ' ') +
+                                         size + string(max_size - size.length() + 2, ' ') +
+                                         time + string(max_time - time.length() + 2, ' ') +
+                                         name + "\n";
+                        
+                        send(sock, formatted.c_str(), formatted.size(), 0);
+                    }
+                } else {
+                    send(sock, "Error opening directory\n", 23, 0);
+                }
+                // Send end-of-transmission marker
+                string eofMarker = "EOF\n";
+                send(sock, eofMarker.c_str(), eofMarker.size(), 0);
+            }
+
+        else if (command == "help"){
             string help_message = "Welcome to the FTP server!\n\n"
-                                "Available server commands:\n"
-                                "ls [-l] [-a] [directory] - List files in the current directory\n"
-                                "  -l: Use long listing format\n"
-                                "  -a: Show hidden files\n"
-                                "cd <directory> - Change directory\n"
-                                "chmod <mode> <file> - Change file permissions\n"
-                                "put <file> - Upload a file\n"
-                                "get <file> - Download a file\n"
-                                "pwd - Print working directory\n"
-                                "status - Show server lock statistics\n"
-                                "close - Disconnect from server\n\n"
-                                "help - To view this help message\n\n"
-                                "Available client commands:\n"
-                                "lls - List files in the local directory\n"
-                                "lcd <directory> - Change local directory\n"
-                                "lchmod <mode> <file> - Change local file permissions\n"
-                                "lpwd - Print local working directory\n";
+                                  "Available server commands:\n"
+                                  "ls - List files in the current directory\n"
+                                  "cd <directory> - Change directory\n"
+                                  "chmod <mode> <file> - Change file permissions\n"
+                                  "put <file> - Upload a file\n"
+                                  "get <file> - Download a file\n"
+                                  "close - Disconnect from server\n\n"
+                                  "help - To view this help message\n\n"
+                                  "Available client commands:\n"
+                                  "lls - List files in the local directory\n"
+                                  "lcd <directory> - Change local directory\n"
+                                  "lchmod <mode> <file> - Change local file permissions\n";
             send(sock, help_message.c_str(), help_message.size(), 0);
         }
 
-        else if (command == "cd") {
-            if (args.empty()) {
+        else if (command.substr(0, 2) == "cd") {
+            if (command.length() < 3) {
                 send(sock, "Error changing directory\n", 24, 0);
                 continue;
             }
             
-            string path = args;
+            string path = command.substr(3);
             string new_path;
             if (!path.empty() && path[0] == '/') {
                 new_path = path;
@@ -842,97 +651,61 @@ void *handle_client(void *client_socket) {
             else {
                 new_path = client_directory + "/" + path;
             }
-            
-            // Acquire read lock to check directory
-            if (!acquire_read_lock_with_retry(new_path)) {
-                send(sock, "Error: Directory busy, try again later\n", 38, 0);
-                continue;
-            }
-            
             struct stat statbuf;
-            bool success = false;
-            
             if (stat(new_path.c_str(), &statbuf) == 0 && S_ISDIR(statbuf.st_mode)) {
                 client_directory = new_path;
                 send(sock, "Directory changed\n", 18, 0);
-                success = true;
             } else {
                 send(sock, "Error changing directory\n", 24, 0);
             }
-            
-            release_read_lock(new_path);
-        }
+     }
 
-        else if (command == "chmod") {
-            // Parse chmod arguments
-            stringstream ss(args);
-            string mode_str, filename;
-            ss >> mode_str >> filename;
-            
-            if (mode_str.empty() || filename.empty()) {
-                send(sock, "Usage: chmod <mode> <file>\n", 26, 0);
+        else if (command.substr(0, 5) == "chmod"){
+            string args = command.substr(6);
+            size_t space = args.find(" ");
+            if (space == string::npos){
+                send(sock, "Invalid chmod command\n", 22, 0);
                 continue;
             }
-            
+
+            string mode = args.substr(0, space);
+            string filename = args.substr(space + 1);
             string filepath = client_directory + "/" + filename;
-            if (!file_exists(filepath)) {
-                string error_msg = "chmod: cannot access '" + filename + "': No such file or directory\n";
-                send(sock, error_msg.c_str(), error_msg.size(), 0);
-                continue;
-            }
 
-            // Get write lock for the file
-            if (!acquire_write_lock_with_retry(filepath)) {
-                send(sock, "Error: File busy, try again later\n", 33, 0);
-                continue;
-            }
+            // Use write lock for chmod (modifying file attributes)
+            write_lock(&rwlock, filepath);
+            bool success = (chmod(filepath.c_str(), stoi(mode, nullptr, 8)) == 0);
+            write_unlock(&rwlock, filepath);
 
-            try {
-                if (chmod(filepath.c_str(), stoi(mode_str, nullptr, 8)) == 0)
-                    send(sock, "Permissions changed\n", 20, 0);
-                else
-                    send(sock, "Error changing permissions\n", 27, 0);
-            } catch (const exception& e) {
-                string error_msg = "Invalid mode: " + mode_str + "\n";
-                send(sock, error_msg.c_str(), error_msg.size(), 0);
-            }
-            
-            release_write_lock(filepath);
+            if (success)
+                send(sock, "Permissions changed\n", 20, 0);
+            else
+                send(sock, "Error changing permissions\n", 27, 0);
         }
         
-        else if (command == "put") {
-            if (args.empty()) {
-                send(sock, "Usage: put <filename>\n", 21, 0);
-                continue;
-            }
-            
-            string filename = args;
+        else if (command.substr(0, 3) == "put") {
+            string filename = command.substr(4);
             string filepath = client_directory + "/" + filename;
             
-            // Check if target is a directory
+            // Check if the target is a directory
             if (is_dir(filepath)) {
-                send(sock, "ERROR_DIR", 9, 0);
-                cout << RED << "Client attempted to upload directory: " << filename << RESET << endl;
+                send(sock, "ERROR: Cannot upload a directory\n", 32, 0);
                 continue;
             }
             
-            // Acquire write lock for file uploading
-            if (!acquire_write_lock_with_retry(filepath)) {
-                send(sock, "ERROR", 5, 0);
-                cout << RED << "Upload rejected for " << filename << ": file is locked by another client" << RESET << endl;
-                continue;
-            }
+            // Acquire exclusive (write) lock for the file
+            write_lock(&rwlock, filepath);
             
             ofstream file(filepath, ios::binary);
             if (!file) {
                 send(sock, "ERROR", 5, 0);
-                release_write_lock(filepath);
+                write_unlock(&rwlock, filepath);
                 continue;
             }
             
             send(sock, "OK", 2, 0);
             const uint32_t ERROR_SIGNAL = 0xFFFFFFFF;
-            cout << "Receiving " << filename << " ..." << endl;
+            cout<<"Recieving "<<filename<<" ..."<<endl;
             
             int p = 1;
             while (true) {
@@ -963,58 +736,42 @@ void *handle_client(void *client_socket) {
             }
             
             file.close();
-            if (p) cout << "File received successfully\n" << endl;
+            if(p) cout<<"File recieved successfully\n"<<endl;
             
-            // Release the file lock
-            release_write_lock(filepath);
+            // Release the write lock
+            write_unlock(&rwlock, filepath);
         }
         
-        else if (command == "get") {
-            if (args.empty()) {
-                send(sock, "Usage: get <filename>\n", 21, 0);
-                continue;
-            }
-            
-            string filename = args;
+        else if (command.substr(0, 3) == "get") {
+            string filename = command.substr(4);
             string filepath = client_directory + "/" + filename;
-            
-            // Check if file exists
-            if (!file_exists(filepath)) {
-                send(sock, "NO", 2, 0);
-                continue;
-            }
-            
-            // Check if path is a directory
+        
+            // Check if the target is a directory
             if (is_dir(filepath)) {
-                send(sock, "DIR", 3, 0);
-                cout << RED << "Client attempted to download directory: " << filename << RESET << endl;
+                send(sock, "NO: Cannot download a directory\n", 34, 0);
                 continue;
             }
             
-            // Acquire read lock for file downloading
-            if (!acquire_read_lock_with_retry(filepath)) {
-                send(sock, "NO", 2, 0);
-                cout << RED << "Download rejected for " << filename << ": file is locked for writing" << RESET << endl;
-                continue;
-            }
+            // Acquire shared (read) lock for the file
+            read_lock(&rwlock, filepath);
             
             ifstream file(filepath, ios::binary);
             if (!file) {
                 send(sock, "NO", 2, 0);
-                release_read_lock(filepath);
+                read_unlock(&rwlock, filepath);
                 continue;
             }
-            
+        
             send(sock, "OK", 2, 0);
             const uint32_t ERROR_SIGNAL = 0xFFFFFFFF;
             char buffer[BUFFER_SIZE];
-            
+        
             cout << "Sending " << filename << " ...\n";
-            
+        
             while (file.read(buffer, BUFFER_SIZE) || file.gcount() > 0) {
                 uint32_t chunk_size = file.gcount();
                 uint32_t net_chunk_size = htonl(chunk_size);
-                
+        
                 if (!send_all(sock, &net_chunk_size, sizeof(net_chunk_size)) || 
                     !send_all(sock, buffer, chunk_size)) {
                     uint32_t net_err = htonl(ERROR_SIGNAL);
@@ -1023,73 +780,50 @@ void *handle_client(void *client_socket) {
                     break;
                 }
             }
-            
+        
             uint32_t zero = htonl(0);
             send_all(sock, &zero, sizeof(zero));
             file.close();
             cout << "File sent successfully\n" << endl;
             
-            // Release the file lock
-            release_read_lock(filepath);
+            // Release the read lock
+            read_unlock(&rwlock, filepath);
         }        
         
-        else if (command == "pwd") {
+        else if (command == "pwd"){
             char actualpath[PATH_MAX];
             if (realpath(client_directory.c_str(), actualpath) != NULL) {
                 string response = string(actualpath);
                 send(sock, response.c_str(), response.size(), 0);
             }
-            else {
-                send(sock, "~", 1, 0);
+            else{
+                send(sock,"~", 1, 0);
             }
         }
         
-        else if (command == "status") {
-            // Capture lock statistics in a string
-            stringstream ss;
-            ss << "\n--- Lock Statistics ---\n";
-            ss << "Active readers: " << active_readers << "\n";
-            ss << "Active writers: " << active_writers << "\n";
-            ss << "Successful read locks: " << lock_stats.successful_read_locks << "\n";
-            ss << "Successful write locks: " << lock_stats.successful_write_locks << "\n";
-            ss << "Failed read locks: " << lock_stats.failed_read_locks << "\n";
-            ss << "Failed write locks: " << lock_stats.failed_write_locks << "\n";
-            ss << "Deadlock preventions: " << lock_stats.deadlock_preventions << "\n";
-            ss << "Timeouts: " << lock_stats.timeouts << "\n";
-            
-            // Active locks
-            ss << "\nActive locks: " << file_locks.size() << "\n";
-            pthread_mutex_lock(&locks_mutex);
-            for (const auto& pair : file_locks) {
-                pthread_mutex_lock(&pair.second->mutex);
-                ss << "  " << pair.first << ": ";
-                ss << "R=" << pair.second->readers << ", ";
-                ss << "W=" << (pair.second->writer_active ? "1" : "0") << ", ";
-                ss << "WR=" << pair.second->waiting_readers << ", ";
-                ss << "WW=" << pair.second->waiting_writers << ", ";
-                ss << "Count=" << pair.second->lock_count << ", ";
-                ss << "By=" << pair.second->current_locker << "\n";
-                pthread_mutex_unlock(&pair.second->mutex);
-            }
-            pthread_mutex_unlock(&locks_mutex);
-            ss << "----------------------\n";
-            
-            string stats = ss.str();
-            send(sock, stats.c_str(), stats.size(), 0);
-        }
-        
-        else if (command == "close") {
-            cout << LBLUE << "Client disconnected.\n";
+        else if (command == "close"){
+            cout <<LBLUE<<"Client disconnected.\n";
             client_count--;
-            cout << "Clients remaining: " << client_count << RESET << endl << endl;
+            cout<<"Clients remaining: "<<client_count<<RESET<<endl<<endl;
             send(sock, "Closing connection...\n\n", 23, 0);
             close(sock);
             pthread_exit(NULL);
         }
 
-        else {
-            cout << RED << "Invalid command: " << command << RESET << endl << endl;
+        else{
+            cout<<RED<<"Invalid command: "<<command<<RESET<<endl<<endl;
             send(sock, "Invalid command\n", 16, 0);
         }
     }
+    
+    // Clean up on server shutdown
+    pthread_mutex_lock(&client_sockets_mutex);
+    client_sockets.erase(
+        remove(client_sockets.begin(), client_sockets.end(), sock),
+        client_sockets.end()
+    );
+    pthread_mutex_unlock(&client_sockets_mutex);
+    
+    close(sock);
+    pthread_exit(NULL);
 }
