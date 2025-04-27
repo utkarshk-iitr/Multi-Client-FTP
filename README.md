@@ -96,6 +96,9 @@ make clean
    - Check file permissions
    - Ensure you have read/write access to the directories
 
-## Contributing
-
-Feel free to submit issues and enhancement requests!
+## Contributors
+- Ankit Kumar 23114006
+- Avik Mandal 23114061
+- Navodit Verma 23114071
+- Kavy Vaghela 23114105
+- Utkarsh Kumar 23114101
