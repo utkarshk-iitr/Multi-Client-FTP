@@ -1,2 +1,1 @@
-Extensive performance anlaysis performed
-and images uploaded for the analysis done 
+Performance anlaysis done and images uploaded for reference
