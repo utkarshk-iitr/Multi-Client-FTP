@@ -321,14 +321,42 @@ string getip(){
     for (ifa = interfaces; ifa != nullptr; ifa = ifa->ifa_next) {
         if (!ifa->ifa_addr) continue;
         if (ifa->ifa_addr->sa_family == AF_INET) {
-            void* addr_ptr = &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
-            char ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, addr_ptr, ip, sizeof(ip));
-            if (string(ip) != "127.0.0.1") myip = ip;
+            // Check if this is a WiFi interface
+            // Common WiFi interface names: wlan, wlp, wl, wifi
+            string ifname = ifa->ifa_name;
+            if (ifname.find("wlan") != string::npos || 
+                ifname.find("wlp") != string::npos || 
+                ifname.find("wl") != string::npos || 
+                ifname.find("wifi") != string::npos) {
+                void* addr_ptr = &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+                char ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, addr_ptr, ip, sizeof(ip));
+                if (string(ip) != "127.0.0.1") {
+                    myip = ip;
+                    break;  // Found WiFi IP, no need to continue
+                }
+            }
         }
     }
     freeifaddrs(interfaces);
-    return myip;
+    
+    // If no WiFi interface found, try to get any non-loopback IPv4 address
+    if (myip.empty()) {
+        for (ifa = interfaces; ifa != nullptr; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_addr) continue;
+            if (ifa->ifa_addr->sa_family == AF_INET) {
+                void* addr_ptr = &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+                char ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, addr_ptr, ip, sizeof(ip));
+                if (string(ip) != "127.0.0.1") {
+                    myip = ip;
+                    break;
+                }
+            }
+        }
+    }
+    
+    return myip.empty() ? "-1" : myip;
 }
 
 bool send_all(int sock, const void* buf, size_t len) {
