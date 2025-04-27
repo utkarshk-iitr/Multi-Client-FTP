@@ -456,14 +456,17 @@ void *handle_client(void *client_socket){
             string help_message = "Welcome to the FTP server!\n\n"
                                   "Available server commands:\n"
                                   "ls - List files in the current directory\n"
+                                  "pwd - Print current directory\n"
                                   "cd <directory> - Change directory\n"
                                   "chmod <mode> <file> - Change file permissions\n"
                                   "put <file> - Upload a file\n"
                                   "get <file> - Download a file\n"
+                                  "clear - Clears the terminal\n"
                                   "close - Disconnect from server\n\n"
                                   "help - To view this help message\n\n"
                                   "Available client commands:\n"
                                   "lls - List files in the local directory\n"
+                                  "lpwd - Print the local directory\n"
                                   "lcd <directory> - Change local directory\n"
                                   "lchmod <mode> <file> - Change local file permissions\n";
             send(sock, help_message.c_str(), help_message.size(), 0);
