@@ -61,13 +61,30 @@ string clean_path(const string& path) {
     if (realpath(path.c_str(), resolved_path) != NULL) {
         return string(resolved_path);
     }
-    return path;  // Return original path if realpath fails
+    
+    // If realpath fails, check if the directory exists
+    // This can happen for new files being created
+    string dir_path = path;
+    size_t last_slash = path.find_last_of('/');
+    if (last_slash != string::npos) {
+        dir_path = path.substr(0, last_slash);
+        if (realpath(dir_path.c_str(), resolved_path) != NULL) {
+            // If directory exists, use absolute directory path + filename
+            return string(resolved_path) + "/" + path.substr(last_slash + 1);
+        }
+    }
+    
+    // If all else fails, return the original path
+    // This ensures we always have a unique identifier for the file
+    cout << "Warning: Could not resolve absolute path for: " << path << endl;
+    return path;
 }
 
 // Acquire a read lock on a specific file
 void read_lock(rwlock_t *rwlock, const string &filename) {
     pthread_mutex_lock(&rwlock->mutex);
     
+    // Get the absolute path of the file for consistent identification
     string clean_filename = clean_path(filename);
     
     // Display waiting status if needed
@@ -82,8 +99,9 @@ void read_lock(rwlock_t *rwlock, const string &filename) {
         cout << RESET << endl;
     }
     
-    // Wait if there's an active writer or waiting writers for this file
-    while (rwlock->locked_files[clean_filename] || rwlock->waiting_writers > 0) {
+    // Wait if there's an active writer on this specific file
+    // Note: We don't wait for waiting writers in general, only for this specific file
+    while (rwlock->locked_files[clean_filename]) {
         pthread_cond_wait(&rwlock->readers_cv, &rwlock->mutex);
     }
     
@@ -101,6 +119,7 @@ void read_lock(rwlock_t *rwlock, const string &filename) {
 void read_unlock(rwlock_t *rwlock, const string &filename) {
     pthread_mutex_lock(&rwlock->mutex);
     
+    // Get the absolute path of the file for consistent identification
     string clean_filename = clean_path(filename);
     
     // Decrement readers count
@@ -116,9 +135,9 @@ void read_unlock(rwlock_t *rwlock, const string &filename) {
     }
     cout << RESET << endl;
     
-    // If no more readers, signal any waiting writers
-    if (rwlock->readers_count == 0 && rwlock->waiting_writers > 0) {
-        cout << CYAN << "] Signaling waiting writers" << RESET << endl;
+    // If no more readers for this file, signal any waiting writers
+    if (rwlock->file_readers[clean_filename] == 0) {
+        cout << CYAN << "No more readers for this file, signaling waiting writers" << RESET << endl;
         pthread_cond_signal(&rwlock->writers_cv);
     }
     
@@ -128,9 +147,10 @@ void read_unlock(rwlock_t *rwlock, const string &filename) {
 // Acquire a write lock on a specific file
 void write_lock(rwlock_t *rwlock, const string &filename) {
     pthread_mutex_lock(&rwlock->mutex);
-    
+
+    // Get the absolute path of the file
     string clean_filename = clean_path(filename);
-    
+
     // Increment waiting writers
     rwlock->waiting_writers++;
     
@@ -138,16 +158,16 @@ void write_lock(rwlock_t *rwlock, const string &filename) {
     if (rwlock->readers_count > 0 || rwlock->locked_files[clean_filename]) {
         cout << YELLOW << "Waiting for WRITE lock on: " << clean_filename;
         
-        if (rwlock->readers_count > 0)
-            cout << " (active readers: " << rwlock->file_readers[clean_filename] << ")";
+        if (rwlock->file_readers[clean_filename] > 0)
+            cout << " (active readers for this file: " << rwlock->file_readers[clean_filename] << ")";
         if (rwlock->locked_files[clean_filename])
             cout << " (file is locked for writing)";
         
         cout << RESET << endl;
     }
     
-    // Wait if there are active readers or another writer on this file
-    while (rwlock->readers_count > 0 || rwlock->locked_files[clean_filename]) {
+    // Wait if there are active readers for this file or another writer on this file
+    while (rwlock->file_readers[clean_filename] > 0 || rwlock->locked_files[clean_filename]) {
         pthread_cond_wait(&rwlock->writers_cv, &rwlock->mutex);
     }
     
@@ -166,6 +186,7 @@ void write_lock(rwlock_t *rwlock, const string &filename) {
 void write_unlock(rwlock_t *rwlock, const string &filename) {
     pthread_mutex_lock(&rwlock->mutex);
     
+    // Get the absolute path of the file for consistent identification
     string clean_filename = clean_path(filename);
     
     // Decrement writers count and mark file as unlocked
@@ -174,8 +195,9 @@ void write_unlock(rwlock_t *rwlock, const string &filename) {
     
     cout << DGREEN << "Released WRITE lock on: " << clean_filename << RESET << endl;
     
-    // Wake up all waiting threads
-    // Readers if no waiting writers, otherwise wake a writer
+    // Wake up all waiting threads for this file
+    // If there are waiting writers, signal one of them
+    // Otherwise, broadcast to all readers
     if (rwlock->waiting_writers > 0) {
         cout << DGREEN << "Signaling next writer" << RESET << endl;
         pthread_cond_signal(&rwlock->writers_cv);
@@ -345,6 +367,14 @@ void *handle_client(void *client_socket){
     cout<<LGREEN<<"Clients connected: "<<client_count<<RESET<<endl<<endl;
 
     while (true){
+        char actualpath[PATH_MAX];
+            if (realpath(client_directory.c_str(), actualpath) != NULL) {
+                string response = string(actualpath);
+                client_directory = response;
+            }
+            else{
+                continue;
+            }
         memset(buffer, 0, BUFFER_SIZE);
         if (recv(sock, buffer, BUFFER_SIZE, 0) <= 0){
             cout << LBLUE<<"Client disconnected.\n";
@@ -519,11 +549,14 @@ void *handle_client(void *client_socket){
             string mode = args.substr(0, space);
             string filename = args.substr(space + 1);
             string filepath = client_directory + "/" + filename;
+            
+            // Get absolute path for consistent file identification
+            string absolute_filepath = clean_path(filepath);
 
             // Use write lock for chmod (modifying file attributes)
-            write_lock(&rwlock, filepath);
-            bool success = (chmod(filepath.c_str(), stoi(mode, nullptr, 8)) == 0);
-            write_unlock(&rwlock, filepath);
+            write_lock(&rwlock, absolute_filepath);
+            bool success = (chmod(absolute_filepath.c_str(), stoi(mode, nullptr, 8)) == 0);
+            write_unlock(&rwlock, absolute_filepath);
 
             if (success)
                 send(sock, "Permissions changed\n", 20, 0);
@@ -534,20 +567,24 @@ void *handle_client(void *client_socket){
         else if (command.substr(0, 3) == "put") {
             string filename = command.substr(4);
             string filepath = client_directory + "/" + filename;
+            // cout<<"File path: "<<filepath<<endl;
+            // cout<<client_directory<<endl;
+            // Get absolute path for consistent file identification
+            string absolute_filepath = clean_path(filepath);
             
             // Acquire exclusive (write) lock for the file
-            write_lock(&rwlock, filepath);
+            write_lock(&rwlock, absolute_filepath);
             
-            ofstream file(filepath, ios::binary);
+            ofstream file(absolute_filepath, ios::binary);
             if (!file) {
                 send(sock, "ERROR", 5, 0);
-                write_unlock(&rwlock, filepath);
+                write_unlock(&rwlock, absolute_filepath);
                 continue;
             }
             
             send(sock, "OK", 2, 0);
             const uint32_t ERROR_SIGNAL = 0xFFFFFFFF;
-            cout<<"Recieving "<<filename<<" ..."<<endl;
+            cout << "Receiving " << filename << " ..." << endl;
             
             int p = 1;
             while (true) {
@@ -578,36 +615,39 @@ void *handle_client(void *client_socket){
             }
             
             file.close();
-            if(p) cout<<"File recieved successfully\n"<<endl;
+            if(p) cout << "File received successfully\n" << endl;
             
             // Release the write lock
-            write_unlock(&rwlock, filepath);
+            write_unlock(&rwlock, absolute_filepath);
         }
         
         else if (command.substr(0, 3) == "get") {
             string filename = command.substr(4);
             string filepath = client_directory + "/" + filename;
-        
-            // Acquire shared (read) lock for the file
-            read_lock(&rwlock, filepath);
             
-            ifstream file(filepath, ios::binary);
+            // Get absolute path for consistent file identification
+            string absolute_filepath = clean_path(filepath);
+
+            // Acquire shared (read) lock for the file
+            read_lock(&rwlock, absolute_filepath);
+            
+            ifstream file(absolute_filepath, ios::binary);
             if (!file) {
                 send(sock, "NO", 2, 0);
-                read_unlock(&rwlock, filepath);
+                read_unlock(&rwlock, absolute_filepath);
                 continue;
             }
-        
+
             send(sock, "OK", 2, 0);
             const uint32_t ERROR_SIGNAL = 0xFFFFFFFF;
             char buffer[BUFFER_SIZE];
-        
+
             cout << "Sending " << filename << " ...\n";
-        
+
             while (file.read(buffer, BUFFER_SIZE) || file.gcount() > 0) {
                 uint32_t chunk_size = file.gcount();
                 uint32_t net_chunk_size = htonl(chunk_size);
-        
+
                 if (!send_all(sock, &net_chunk_size, sizeof(net_chunk_size)) || 
                     !send_all(sock, buffer, chunk_size)) {
                     uint32_t net_err = htonl(ERROR_SIGNAL);
@@ -616,14 +656,14 @@ void *handle_client(void *client_socket){
                     break;
                 }
             }
-        
+
             uint32_t zero = htonl(0);
             send_all(sock, &zero, sizeof(zero));
             file.close();
             cout << "File sent successfully\n" << endl;
             
             // Release the read lock
-            read_unlock(&rwlock, filepath);
+            read_unlock(&rwlock, absolute_filepath);
         }        
         
         else if (command == "pwd"){
