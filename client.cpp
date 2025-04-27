@@ -135,7 +135,10 @@ int main(int argc, char *argv[]){
 
         string command = input.substr(0, input.find(" "));
         string arg = (input.find(" ") != string::npos) ? input.substr(input.find(" ") + 1) : "";
-
+        if(command == "command" && !arg.empty()){
+            cout << "Usage: pwd\n";
+            continue;
+        }
         if (command == "lls" && arg.empty()){
             DIR *dir;
             struct dirent *entry;
@@ -237,6 +240,10 @@ int main(int argc, char *argv[]){
             else
                 cout << "Error changing directory\n";
         }else if(command == "lpwd"){
+            if(!arg.empty()){
+                cout << "Usage: lpwd\n";
+                continue;
+            }
             char cwd[PATH_MAX];
             if (getcwd(cwd, sizeof(cwd)) != NULL) {
                 cout << "Current directory: " << cwd << endl;
@@ -314,7 +321,7 @@ void send_command(int sock, string command){
 // Helper function to format file size
 string format_size(uint64_t bytes) {
     static const vector<string> units = {"B", "KB", "MB", "GB"};
-    size_t unit = 0;
+    int unit = 0;
     double size = bytes;
     
     while (size >= 1024 && unit < units.size() - 1) {
@@ -371,6 +378,11 @@ void handle_put(int sock, string filename) {
     const uint32_t ERROR_SIGNAL = 0xFFFFFFFF;
     char buffer[BUFFER_SIZE];
     int p = 1;
+    
+    // Get file size
+    file.seekg(0, ios::end);
+    uint64_t file_size = file.tellg();
+    file.seekg(0, ios::beg);
     
     // Start timing
     auto start_time = chrono::high_resolution_clock::now();
