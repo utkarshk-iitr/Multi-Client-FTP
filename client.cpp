@@ -246,7 +246,7 @@ int main(int argc, char *argv[]){
             }
             char cwd[PATH_MAX];
             if (getcwd(cwd, sizeof(cwd)) != NULL) {
-                cout << "Current directory: " << cwd << endl;
+                cout << "Client directory: " << cwd << endl;
             } else {
                 perror("getcwd() error");
             }
