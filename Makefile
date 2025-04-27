@@ -1,63 +1,27 @@
-CXX = g++
-CXXFLAGS = -Wall -Wextra -std=c++17 -O2
-LDFLAGS = -pthread
-
-# Debug flags (for debug target)
-DEBUG_FLAGS = -g -O0 -DDEBUG
-
-# Binary names
-SERVER_BIN = server
-CLIENT_BIN = client
-FTPSERVER_BIN = ftpserver
+CC = g++
 
 # Source files
-SERVER_SRC = se.cpp
-CLIENT_SRC = cl.cpp
+SERVER_SRC = server.cpp
+CLIENT_SRC = client.cpp
 
-# Targets
-all: $(SERVER_BIN) $(CLIENT_BIN)
+# Executable names
+SERVER_EXE = server
+CLIENT_EXE = client
 
-# Build rules
-$(SERVER_BIN): $(SERVER_SRC)
-	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
+# Default target
+all: $(SERVER_EXE) $(CLIENT_EXE)
 
-$(CLIENT_BIN): $(CLIENT_SRC)
-	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
+# Build server
+$(SERVER_EXE): $(SERVER_SRC)
+	$(CC) $(SERVER_SRC) -o $(SERVER_EXE)
 
-# Target for the ftpserver (uncomment if source file is available)
-# $(FTPSERVER_BIN): ftpserver.cpp
-#	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
+# Build client
+$(CLIENT_EXE): $(CLIENT_SRC)
+	$(CC) $(CLIENT_SRC) -o $(CLIENT_EXE)
 
-# Debug builds
-debug: debug_server debug_client
-
-debug_server: $(SERVER_SRC)
-	$(CXX) $(CXXFLAGS) $(DEBUG_FLAGS) $< -o $(SERVER_BIN)_debug $(LDFLAGS)
-
-debug_client: $(CLIENT_SRC)
-	$(CXX) $(CXXFLAGS) $(DEBUG_FLAGS) $< -o $(CLIENT_BIN)_debug $(LDFLAGS)
-
-# Install target (adjust destination as needed)
-install: all
-	install -m 755 $(SERVER_BIN) /usr/local/bin/
-	install -m 755 $(CLIENT_BIN) /usr/local/bin/
-
-# Clean targets
+# Clean build files
 clean:
-	rm -f $(SERVER_BIN) $(CLIENT_BIN) $(FTPSERVER_BIN)
+	rm -f $(SERVER_EXE) $(CLIENT_EXE)
 
-cleanall: clean
-	rm -f $(SERVER_BIN)_debug $(CLIENT_BIN)_debug
-	rm -f *.o core
-
-# Help target
-help:
-	@echo "Available targets:"
-	@echo "  all       : Build server and client (default)"
-	@echo "  debug     : Build debug versions with symbols"
-	@echo "  clean     : Remove binaries"
-	@echo "  cleanall  : Remove all generated files"
-	@echo "  install   : Install binaries to /usr/local/bin"
-	@echo "  help      : Show this help message"
-
-.PHONY: all clean cleanall debug debug_server debug_client install help 
+# Phony targets
+.PHONY: all clean 

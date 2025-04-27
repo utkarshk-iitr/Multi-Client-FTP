@@ -149,6 +149,7 @@ void display_memory_stats() {
 
 // Function to periodically display stats
 void* stats_display_thread(void* arg) {
+    (void)arg;  // Mark parameter as unused
     while (true) {
         sleep(30);  // Check every 30 seconds
         display_memory_stats();
@@ -328,9 +329,9 @@ string getip(){
                 ifname.find("wlp") != string::npos || 
                 ifname.find("wl") != string::npos || 
                 ifname.find("wifi") != string::npos) {
-                void* addr_ptr = &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
-                char ip[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, addr_ptr, ip, sizeof(ip));
+            void* addr_ptr = &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+            char ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, addr_ptr, ip, sizeof(ip));
                 if (string(ip) != "127.0.0.1") {
                     myip = ip;
                     break;  // Found WiFi IP, no need to continue
@@ -401,6 +402,7 @@ void cleanup_and_exit() {
 
 // Modify the signal handler
 void signal_handler(int signum) {
+    (void)signum;  // Mark parameter as unused
     cout << "\n" << YELLOW << "Do you want to shut down the server? (y/n): " << RESET;
     char response;
     cin >> response;

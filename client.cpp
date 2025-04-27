@@ -314,7 +314,7 @@ void send_command(int sock, string command){
 // Helper function to format file size
 string format_size(uint64_t bytes) {
     static const vector<string> units = {"B", "KB", "MB", "GB"};
-    int unit = 0;
+    size_t unit = 0;
     double size = bytes;
     
     while (size >= 1024 && unit < units.size() - 1) {
@@ -371,11 +371,6 @@ void handle_put(int sock, string filename) {
     const uint32_t ERROR_SIGNAL = 0xFFFFFFFF;
     char buffer[BUFFER_SIZE];
     int p = 1;
-    
-    // Get file size
-    file.seekg(0, ios::end);
-    uint64_t file_size = file.tellg();
-    file.seekg(0, ios::beg);
     
     // Start timing
     auto start_time = chrono::high_resolution_clock::now();
