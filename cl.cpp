@@ -127,7 +127,7 @@ int main(int argc, char *argv[]){
             continue;
         }
 
-        if (command == "clear") {
+        if (command == "clear" && arg.empty()) {
             cout << "\033[2J\033[H";
             continue;
         }
@@ -223,7 +223,7 @@ int main(int argc, char *argv[]){
             }
         }
 
-        else if (command == "help"){
+        else if (command == "help" && arg.empty()){
             send_command(sock, "help");
         }     
 
@@ -232,7 +232,9 @@ int main(int argc, char *argv[]){
                 cout << "Directory changed\n";
             else
                 cout << "Error changing directory\n";
-        }else if(command == "lpwd"){
+        }
+        
+        else if(command == "lpwd" && arg.empty()){
             char cwd[PATH_MAX];
             if (getcwd(cwd, sizeof(cwd)) != NULL) {
                 cout << "Current directory: " << cwd << endl;
@@ -269,7 +271,7 @@ int main(int argc, char *argv[]){
             handle_get(sock, arg);
         }
 
-        else if (command == "close"){
+        else if (command == "close" && arg.empty()){
             send_command(sock, "close");
             break;
         }
