@@ -63,6 +63,7 @@ The server will display its IP address and start listening for connections.
 - `chmod <mode> <file>` - Change file permissions
 - `pwd` - Print working directory
 - `help` - Show help message
+- `clear` - Clears the terminal
 - `close` - Disconnect from server
 
 #### Client Commands:
